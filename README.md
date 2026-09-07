@@ -101,7 +101,7 @@ see `perso/README.md` before changing `max_duration` or `cost_batching.budget`, 
 
 ## What is deliberately not in this repo
 
-- **`perso/oli_spoken_dataset/`**, 205 clips of my own voice reading drug names aloud. It was the
+- **`perso/oli_spoken_dataset/`**, 205 clips of my own voice reading sentences containing drug names aloud. It was the
   only real (non-synthetic) in-domain signal in the whole setup and one of the six equally weighted
   checkpoint monitors, so it is still referenced in `training_config.yaml` to keep that an accurate
   record. It will not resolve on a fresh clone. See the note at those entries for how to run
