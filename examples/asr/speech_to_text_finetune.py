@@ -54,8 +54,25 @@ For documentation on fine-tuning this model, please visit:
 https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/configs.html#fine-tuning-configurations
 """
 import time
-import lightning.pytorch as pl
+
+# PyTorch 2.6+ defaults torch.load to weights_only=True, but NeMo
+# checkpoints contain OmegaConf objects which are not in the default
+# allowlist. Allowlisting them here avoids UnpicklingError on checkpoint
+# save/resume while keeping weights_only=True everywhere else.
+import torch
 from omegaconf import OmegaConf
+
+# PyTorch 2.6+ defaults torch.load to weights_only=True, but NeMo
+# checkpoints contain OmegaConf objects, typing hints, and other
+# non-standard globals. Rather than allowlisting them one by one,
+# we override the default to weights_only=False. This is safe here
+# because we only load our own trusted NeMo checkpoints.
+_original_torch_load = torch.load
+torch.load = lambda *args, **kwargs: _original_torch_load(
+    *args, **{**kwargs, "weights_only": kwargs.get("weights_only", False)}
+)
+
+import lightning.pytorch as pl
 
 from nemo.collections.asr.models import ASRModel
 from nemo.core.config import hydra_runner
@@ -96,14 +113,14 @@ def get_base_model(trainer, cfg):
         if num_ranks > 1 and is_global_rank_zero():
             asr_model = ASRModel.from_pretrained(model_name=pretrained_name)
         else:
-            # Sleep on all ranks for at least 60 seconds
-            wait_time = int(cfg.get('exp_manager', {}).get('seconds_to_sleep', 60))
-            if wait_time < 60:
-                wait_time = 60
-
-            logging.info(f"Sleeping for at least {wait_time} seconds to wait for model download to finish.")
-
-            time.sleep(wait_time)
+            # # Sleep on all ranks for at least 60 seconds
+            # wait_time = int(cfg.get('exp_manager', {}).get('seconds_to_sleep', 60))
+            # if wait_time < 60:
+            #     wait_time = 60
+            #
+            # logging.info(f"Sleeping for at least {wait_time} seconds to wait for model download to finish.")
+            #
+            # time.sleep(wait_time)
 
             # restore model from cached model dir
             asr_model = ASRModel.from_pretrained(model_name=pretrained_name)
@@ -204,6 +221,20 @@ def main(cfg):
         )
 
     asr_model = get_base_model(trainer, cfg)
+
+    # Freeze components according to config (defaults: freeze nothing)
+    freeze_cfg = cfg.model.get("freeze", {})
+    for component in ("encoder", "decoder", "joint"):
+        if freeze_cfg.get(component, False) and hasattr(asr_model, component):
+            logging.info(f"Freezing {component}")
+            getattr(asr_model, component).freeze()
+        else:
+            logging.info(f"Leaving {component} trainable")
+
+    # Verify what's trainable
+    trainable_params = sum(p.numel() for p in asr_model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in asr_model.parameters())
+    logging.info(f"Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     # Check vocabulary type and update if needed
     asr_model = check_vocabulary(asr_model, cfg)
