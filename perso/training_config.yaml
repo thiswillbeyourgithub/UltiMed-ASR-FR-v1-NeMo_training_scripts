@@ -1,0 +1,1570 @@
+# ============================================================================
+# Goal: teach the model French medical vocabulary at scale (UltiMed-ASR-FR)
+# without hurting its general-purpose / multilingual accuracy.
+#
+# Training mix (balanced view is AUDIO-HOURS, not clip counts):
+#
+#   Figures below are what actually reaches the model, i.e. AFTER the 38 s
+#   max_duration cap (see train_ds.max_duration for why the cap exists).
+#
+#   Dataset          Train clips   Hours    Share   Licence
+#   ---------------  -----------  -------  ------  -----------------
+#   UltiMed-ASR-FR       479,246  2,398.3   98.7%  own (CC BY 4.0)
+#   diy                    4,528     21.7    0.9%  own TTS output
+#   drug_sentence          4,099      9.7    0.4%  own TTS output
+#   ---------------  -----------  -------  ------  -----------------
+#   Total                487,873  2,429.6    100%
+#
+#   Uncapped the mix would be 494,667 clips / 2,515.7 h, so the cap now costs
+#   only 3.4% of the hours. It used to cost 13.2% at the old 25 s cap: the
+#   adaptive batch sampler (train_ds.cost_batching) is what bought that back,
+#   by sizing each batch to a memory budget instead of a fixed clip count.
+#
+#   united_syn_med was REMOVED from training: it is CC BY-SA 4.0
+#   (ShareAlike), which is legally murky for a released model and
+#   incompatible with the planned permissive release. It stays in
+#   val/test for regression tracking (evaluation is not distribution).
+#   fleurs stays out of training; val/test unchanged for tracking.
+#
+#   UltiMed-ASR-FR (https://huggingface.co/datasets/Olicorne/UltiMed-ASR-FR):
+#   601k clips / 3,105 h of synthetic French medical speech (Voxtral TTS,
+#   single voice fr_female, 24 kHz FLAC; NeMo resamples to 16 kHz on the
+#   fly). Sources: dictionary (85.6% of hours), PARHAF (11.8%),
+#   drugs (2.5%), acronyms (0.1%). PARROT subset is CC BY-NC-SA,
+#   EVAL-ONLY: never in train, used as out-of-domain radiology monitor.
+#
+#   Validation: fleurs (de en fr fi it sv) + diy + drug_sentence + oli +
+#   united_syn_med + seeded UltiMed slices (built by
+#   perso/build_ultimed_val_slices.py, ~8 h total).
+#
+#   Single-voice caveat: the whole new corpus is one TTS voice, so audio
+#   augmentation (white noise / gain / RIR) + SpecAugment time masks +
+#   the two old sets' different voices are the guard against overfitting
+#   to that voice's acoustics.
+# ============================================================================
+#
+# Fine-tuning configuration for parakeet-tdt-0.6b-v3 on French medical audio
+# Training script: examples/asr/speech_to_text_finetune_cached.py
+#   (despite the name it is the entry point for BOTH modes; with
+#   use_cached_encoder: false it trains the standard way while keeping the
+#   fork's extras: partial encoder unfreeze, AdamSPD, macro metrics,
+#   frozen-module eval pinning.)
+# Run with perso/training_start.sh (crash-relaunch wrapper), or directly:
+#   python examples/asr/speech_to_text_finetune_cached.py \
+#       --config-dir=$PWD/perso --config-name=training_config
+# Model will be loaded from pretrained and tokenizer will be kept as-is
+
+name: "parakeet-tdt-ultimed-french-medical"
+
+# ============================================================================
+# Cached encoder training (optional, for speed)
+# When the encoder is frozen, we can precompute its outputs once and train
+# only decoder+joint on cached features.  This eliminates the encoder forward
+# pass (~97% of compute) from every training step.
+#
+# To use:
+#   1. Run  precompute_encoder_cache.py  to generate the cache.
+#   2. Set  use_cached_encoder: true  below.
+#   3. Run  speech_to_text_finetune_cached.py  instead of the standard script.
+#
+# DISABLED for the UltiMed run: the cache stores encoder outputs per variant,
+# ~230 GB per variant for the 2,516 h corpus, x6 variants = ~1.4 TB. No disk
+# for that, and partial unfreeze (last 4 layers) shrinks the compute win
+# anyway. speech_to_text_finetune_cached.py with use_cached_encoder: false
+# trains the standard way (encoder forward on GPU each step).
+# ============================================================================
+use_cached_encoder: false
+encoder_cache_dir: "./perso/encoder_cache_ignore_backups"
+
+# Encoder cache management. Only applies when use_cached_encoder is true.
+encoder_cache:
+  # Check freshness and rebuild automatically before training starts.
+  # Set to false to manage the cache manually via precompute_encoder_cache.py.
+  auto_rebuild: true
+  # Also compute per-dimension augmentation stats (cache_stats.json).
+  # Only useful when latent_augment.enabled is true.
+  compute_stats: false
+
+# Number of cached variants per audio sample (requires re-running
+# precompute_encoder_cache.py with --variants-per-sample N):
+#   - Variant 0: always clean (eval mode, no augmentation).
+#   - Variants 1..N-1: augmented draws from train_ds.augmentor + spec_augment.
+#     asr_model.train() is set during generation, so encoder dropout also
+#     contributes additional stochasticity (intentional).
+# At training time the dataset randomly picks one variant per __getitem__.
+# With N>1, real audio augmentations (RIR, white noise, gain) are faithfully
+# captured by the encoder rather than approximated by latent Gaussian noise.
+# Recommend reducing latent_augment.noise_scale_multiplier to 0.1-0.2 when
+# using multiple variants (real augmentations already provide most variability).
+# Disk cost: ~N× the clean cache size.
+# MOVED under model: on 2026-08-23. It lived at the top level until then, but
+# precompute_encoder_cache.py reads it as model.cache_variants_per_sample, so
+# the top-level value was never seen and the cache builder silently used its
+# default of 1 instead of this 6. Dormant while use_cached_encoder is false,
+# but it would have quietly built a 6x smaller cache. Found by the config
+# audit (see nemo/collections/asr/parts/utils/config_audit.py).
+
+# Pretrained model initialization
+# Use init_from_pretrained_model for automatic download from NGC
+init_from_pretrained_model: "nvidia/parakeet-tdt-0.6b-v3"
+# Alternative: Use init_from_nemo_model if you have a local .nemo file
+# init_from_nemo_model: "/path/to/parakeet-tdt-0.6b-v3.nemo"
+
+model:
+  # Seed for deterministic training: data shuffling, dropout, augmentation.
+  # Applied via lightning.seed_everything() at the top of main(). It was read
+  # by nothing at all until 2026-08-23, so the run was unseeded despite this
+  # being set; found by the config audit.
+  # Note the cost batch sampler carries its own independent seed in
+  # model.train_ds.cost_batching.seed.
+  seed: 42424242
+
+  # Number of encoder-cache variants to precompute per sample. Only used by
+  # perso/precompute_encoder_cache.py, i.e. only when use_cached_encoder is
+  # true. Moved here from the top level on 2026-08-23, see the note there.
+  cache_variants_per_sample: 6
+
+  # Model architecture summary (parakeet-tdt-0.6b-v3):
+  #
+  #   Component          Type                              Params   Mode
+  #   ----------------   -------------------------------   ------   -----
+  #   preprocessor       AudioToMelSpectrogramPreprocessor      0   train
+  #   encoder            ConformerEncoder                  608  M   last 4 of 24
+  #                                                                 layers train
+  #   decoder            RNNTDecoder                        11.8M   train
+  #   joint              RNNTJoint                           6.3M   train
+  #   loss               RNNTLoss                                0   train
+  #   spec_augmentation  SpectrogramAugmentation                 0   train
+  #
+  #   Trainable:  ~120M  (4 conformer layers ~100M + decoder + joint)
+  #   Frozen:     ~508M  (encoder layers 0-19 + pre_encode + pos_enc)
+  #   Total:       627M  (~2.5 GB weights in bf16/fp32 mix)
+  #
+  # Freeze specific model components to preserve general capabilities.
+  # The training script reads these flags and calls .freeze() accordingly.
+  # For a transducer (TDT) model the components are:
+  #   encoder  – large acoustic feature extractor (~95% of params)
+  #   decoder  – small prediction/language-model network
+  #   joint    – small network combining encoder + decoder outputs
+  # For the UltiMed run: 3,105 h of new French medical vocabulary justifies
+  # letting the top of the encoder move (phonetic/lexical abstractions live
+  # there; bottom layers stay pretrained to preserve multilinguality), and
+  # AdamSPD + the frozen bottom + FLEURS monitoring guard against drift.
+  # Frozen modules are also PINNED TO EVAL MODE for the whole run by
+  # _FrozenEvalCallback in the training script: in standard (non-cached)
+  # mode the frozen layers still run forward, and Lightning's model.train()
+  # would otherwise let their BatchNorm running stats drift for 10 days.
+  freeze:
+    encoder: true
+    # Unfreeze the last N conformer layers (+ out_proj) of the encoder.
+    # 0 → full encoder freeze.
+    # >0 → partial freeze. In cached mode the cache must be regenerated at
+    #      the matching cut layer; in standard mode (current setup) no cache
+    #      is involved.
+    #
+    # History, measured on the same harness against the pretrained baseline
+    # (combined_macro 18.43, in-domain 4-set macro 22.91, fleurs fr+en 9.47):
+    #
+    #   1.1.0, N=4 (118.9M trainable, 19%): best macro 7.08 at step 7500.
+    #     Ran to step 34228 and ended at 9.11 with fleurs fr+en at 18.78.
+    #   1.2.0, N=0 (18.1M trainable, 2.9%): macro bottomed out at 9.61 by step
+    #     15432 and flattened there. Forgetting was a seventh of 1.1.0's at the
+    #     same step (fleurs fr+en +0.48 vs +3.43), so the freeze did its job,
+    #     but in-domain stalled at 9.43 against 1.1.0's 5.38 at step 7500. With
+    #     the encoder fixed, the decoder and joint cannot get under it.
+    #
+    # 1.2.0's best was worse than 1.1.0's WORST, so a full freeze is the wrong
+    # end of the range. The real fault in 1.1.0 was duration, not N: its macro
+    # was already best at step 7500 and its LR was still at peak there, because
+    # sched.max_steps was set for 12 epochs. It drove through the optimum.
+    #
+    #   1.3.0, N=4 + 10k anneal (118.9M trainable): 7.21 at the endpoint,
+    #     which was also the best point; no drift phase. In-domain 5.67,
+    #     fleurs fr+en 10.31. Confirms the frontier at this N and duration.
+    #
+    # 1.3.0 went BACK to N=4 rather than interpolating to 2, because
+    # under the monitored macro the arithmetic favours the known trajectory:
+    # beating 7.08 needs the in-domain 4-set at <=5.4 with N=4's measured
+    # forgetting (+1.0 fleurs fr+en), which N=4 already demonstrated at step
+    # 7500, or at <=5.7 with N=2's hoped-for +0.3, which requires the last two
+    # layers alone (half the N=4 encoder mass) to close ~92% of the 4-point
+    # in-domain gap 1.2.0 exposed. The first is a demonstrated fact, the
+    # second is a bet. What actually changes in 1.3.0 is the schedule: the
+    # cosine now lands ON the optimum instead of driving past it, see
+    # trainer.max_steps below. N=2 remains the fallback if the end-state
+    # forgetting is unacceptable; rehearsal data is the lever after that.
+    encoder_except_last_n: 4
+    joint: false
+    decoder: false
+
+  # Latent-space augmentation for cached-encoder training.
+  # Replaces SpecAugment + audio augmentors when use_cached_encoder is true.
+  # Ignored in standard training mode.
+  latent_augment:
+    # Set enabled: false to skip all latent augmentation (no-op pass-through).
+    # Default is false; set to true to activate the augmentations below.
+    enabled: false
+    # Per-dimension noise from cache_stats.json (computed by
+    # precompute_encoder_cache.py --compute-stats).  When the stats file
+    # exists, each encoder dimension gets noise proportional to its
+    # empirical std under real audio augmentations, instead of the uniform
+    # gaussian_noise_scale below.
+    # use_per_dim_noise: true        # use per-dim stats if cache_stats.json exists
+    noise_scale_multiplier: 0.001    # scale factor applied to empirical per-dim std
+                                   # reduce to 0.1-0.2 when cache_variants_per_sample > 1
+                                   # (real augmented variants then provide most variability)
+    gaussian_noise_scale: 0.001    # fallback if no stats file — ~12% of mean activation magnitude (0.0171)
+    feature_dropout: 0          # probability of zeroing a feature dimension (0 disables)
+                                   # lowered from 0.05; outlier dims are now exempt (see below)
+    # time_mask_num: 1               # number of contiguous time masks per sample
+    # time_mask_width: 5             # max width (encoder frames) of each time mask
+    # Outlier-dim protection (computed by precompute_encoder_cache.py --compute-stats).
+    # Transformer encoders have a small set of "outlier features" with
+    # disproportionately large magnitudes that carry disproportionate signal
+    # (cf. Dettmers et al., LLM.int8()). Protected dims receive zero noise and
+    # are never zeroed by feature_dropout. Time masking is unaffected.
+    # Empirically validated for this exact model by the SmoothQuant int8 export
+    # (https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-smoothquant-onnx):
+    # the 46 worst-quantizing MatMuls were all FFN linear2 down-projections
+    # (where per-channel activation outliers live), with a clean loss gap
+    # before the first attention layer. Two lessons for perturbing cached
+    # latents here: (1) protecting outlier dims from noise/dropout is the
+    # right shape, and (2) one uniform noise scale across all dims is
+    # structurally the same per-tensor mistake that made naive int8 collapse
+    # on long audio, so prefer the per-dim stats path if re-enabling noise.
+    # outlier_top_k_frac: 0.05           # protect top 1% of dims by mean-abs activation
+    # outlier_kurtosis_threshold: 20.0   # also protect dims with kurtosis above this (Gaussian≈3)
+
+  # L2-SP: L2 regularization toward pretrained weights (Xuhong et al., 2018).
+  # Disabled in favor of AdamSPD (Selective Projection Decay), which
+  # achieves the same goal but operates inside the optimizer step and
+  # only decays weights when the gradient pushes them *further away*
+  # from pretrained values. See optim section below.
+  l2sp:
+    enabled: false          # disabled — SPD (via AdamSPD optimizer) replaces this
+    # lambda: 0.005           # kept for reference if re-enabling
+
+  # Keep existing tokenizer - do not retrain
+  tokenizer:
+    update_tokenizer: false
+
+  # RNNT/TDT joint: the single biggest memory knob on this GPU.
+  #
+  # The joint materializes a [B, T, U, V] lattice, V = 8198 (8192 vocab +
+  # blank + 5 TDT duration outputs), T = duration * 12.5 (8x subsampling on a
+  # 10 ms hop) and U = tokens + 1. This corpus runs about 10 tokens/s, so a
+  # 25 s clip is 312 * 196 * 8198 = 501 M elements. The loss keeps a dense
+  # fp32 gradient tensor of that shape alive until backward, and transiently
+  # holds a bf16 copy plus an fp32 cast of it as well.
+  #
+  # fuse_loss_wer already splits joint+loss into sub-batches, but the
+  # pretrained checkpoint ships fused_batch_size=4. At batch_size=4 that is
+  # one single sub-batch, so every clip gets padded to the longest one in the
+  # batch and the cost is B * max(T) * max(U) * V. Measured: a batch of four
+  # 45 s clips asks for a single 20.87 GiB allocation and dies.
+  #
+  # fused_batch_size=1 processes one clip at a time, so the cost follows
+  # sum_i(T_i * U_i) with no padding amplification. Only the fp32 gradient
+  # tensors stay resident across the sub-batches; the large transients live
+  # for one clip at a time.
+  joint:
+    fused_batch_size: 1
+
+  # Training dataset configuration
+  train_ds:
+    # Multiple training manifests are concatenated by NeMo (one pass over
+    # every listed manifest = one epoch).
+    #
+    # BALANCE BY AUDIO-SECONDS, NOT CLIP COUNT. RNNT loss per sample grows
+    # with utterance length, so gradient exposure follows audio time.
+    # Mix by hours after the 38 s cap: UltiMed 2,398.3 h (86.2%), Common
+    # Voice rehearsal 351.7 h (12.6%: fr 200.0, en 100.0, de 20.0, it 20.0,
+    # sv-SE 9.1, fi 2.6, the last two being their full CV train pools),
+    # diy 21.7 h (0.8%), drug_sentence 9.7 h (0.3%); total ~2,781.4 h.
+    # The two old sets are kept less for their weight than for their
+    # different TTS voices (UltiMed is single-voice) and as continuity with
+    # the previous runs. No upsampling: UltiMed IS the target domain, and
+    # the CV share is set by how many hours were physically sampled (see
+    # the prep script).
+    manifest_filepath:
+      # UltiMed-ASR-FR train split: 486,007 clips / 2,484 h on disk, 479,246
+      # clips / 2,398.3 h after the 38 s cap (dictionary + drugs + PARHAF +
+      # acronyms; NO PARROT, it is eval-only CC BY-NC-SA; NO val/test rows).
+      # Verified by scanning the manifest: every audio path resolves to
+      # dictionary/, PARHAF/, drugs/ or acronyms/, all CC BY 4.0, so a
+      # permissive release of the fine-tune is clean.
+      # Audio paths inside are relative to the manifest
+      # directory; perso/ultimed_data_ignore-backups is a symlink to the
+      # dataset root on the SSD, so nothing user-specific is committed.
+      # 24 kHz FLAC, resampled to 16 kHz on the fly by the dataloader.
+      - "./perso/ultimed_data_ignore-backups/NeMO_files/train.jsonl"
+      # sentences containing drugs and dosages read out loud by TTS (4100 samples)
+      - "./perso/drug_sentence_dataset/train.json"
+      # DIY medical dataset
+      - "./perso/nemo_dataset/train.json"
+      # United Synthetic Medical dataset: REMOVED from training (CC BY-SA
+      # 4.0 ShareAlike, incompatible with the planned permissive release of
+      # the fine-tuned weights). Still evaluated in val/test.
+      # - "./perso/downloaded_datasets_ignore-backups/united_syn_med/train/train.unparenthesized.uncapitalized.kept.down-8k.wo_commas.json"
+      # FLEURS train splits: NOT used. fleurs is the external forgetting
+      # canary (fr+en are in the monitored macro), so training on it would
+      # blind the one probe that is clean. The local splits are also tiny
+      # (~2.3 h/language), too small to rehearse with anyway.
+      # - "./perso/downloaded_datasets_ignore-backups/fleurs/en/train.altered.json"
+      # - "./perso/downloaded_datasets_ignore-backups/fleurs/fr/train.altered.json"
+      # Common Voice 22.0 rehearsal (new in 1.4.0): 139,437 clips / 200.0 h fr
+      # + 61,164 clips / 100.0 h en, sampled (seed 42) and converted to 16 kHz
+      # mono FLAC by perso/prepare_commonvoice_rehearsal.py. Sentences are the
+      # original cased+punctuated CV text, so the style matches the model's
+      # output convention. CV (MCV v7.0) is part of parakeet v3's pretraining
+      # set, making this replay-style rehearsal against the forgetting every
+      # earlier run showed on fleurs-EN and the unmonitored languages
+      # (1.3.0: sv +2.9, fi +4.0 vs baseline). ~11% of audio-seconds, 2:1
+      # fr:en to favour the deployment language without abandoning English.
+      # CC0-1.0, so the planned permissive release stays clean. Reached via
+      # the gitignored symlink perso/downloaded_datasets_ignore-backups/
+      # commonvoice -> the dataset drive; audio paths are relative to the
+      # manifest like the UltiMed set above.
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_fr_train.jsonl"
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_en_train.jsonl"
+      # 1.5.0: the four remaining monitored languages get the same treatment,
+      # after 1.4.0 proved fr/en replay erases forgetting at zero in-domain
+      # cost while unprotected sv (+2.2 within-run) and fi (+3.8) kept
+      # sliding. de/it at 20 h each; sv-SE and fi are their entire CV train
+      # pools (9.1 h / 2.6 h), which is why they are smaller. FLEURS itself
+      # stays strictly out of training so its val sets remain out-of-corpus
+      # probes for every language.
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_de_train.jsonl"
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_it_train.jsonl"
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_sv-SE_train.jsonl"
+      - "./perso/downloaded_datasets_ignore-backups/commonvoice/cv_fi_train.jsonl"
+    sample_rate: 16000
+
+    # Standard (non-cached) mode: the full encoder runs on GPU each step.
+    #
+    # batch_size is only a FALLBACK now: with cost_batching enabled below, each
+    # batch is sized by memory cost and this value is ignored. It is what NeMo
+    # builds the dataloader with before the sampler replaces it, and what a run
+    # with cost_batching disabled would use.
+    #
+    # Measured worst case with a FIXED batch size (200 clips all sitting at the
+    # cap with the longest transcripts available at that length, i.e. every
+    # batch is the worst batch training can draw), peak VRAM out of 24564 MiB:
+    #   cap 25 / batch 4 -> 23353  OK
+    #   cap 25 / batch 6 -> 23940  OK   (only 624 MiB spare)
+    #   cap 30 / batch 2 -> 21130  OK
+    #   cap 30 / batch 3 -> 23983  OK   (only 581 MiB spare)
+    #   cap 35 / batch 2 -> 23948  OK   (only 616 MiB spare)
+    #   cap 40 / batch 1 -> 23409  OK   (1155 MiB spare)
+    #   cap 30 / batch 4 -> OOM
+    #   cap 35 / batch 4 -> OOM
+    #   cap 40 / batch 4 -> OOM
+    #   cap 45 / batch 1 -> OOM  (needed 5.18 GiB more than the card has)
+    # Those ten points are what the cost model below was fitted on. On the real
+    # (mixed-length) manifests the peak is far lower; they are the ceiling.
+    #
+    # OOM FALLBACK (technique de gitan, in order):
+    #   1. cost_batching.budget: 13000 (cheapest, shrinks every batch at once,
+    #      and drop max_duration to 36.0 to match: see the sqrt rule below)
+    #   2. cost_batching.max_total_duration: 180.0 (only bites short-clip batches)
+    #   3. cost_batching.enabled: false, batch_size 4, max_duration 25.0
+    #      (falls back to the previously validated fixed-batch setup)
+    batch_size: 4
+
+    # --- Adaptive batch size ------------------------------------------------
+    # Packs every batch up to a memory budget instead of a fixed clip count, so
+    # one batch is a single 38 s clip and the next is sixteen 14 s ones.
+    # Implemented as DurationCostBatchSampler in
+    # nemo/collections/asr/parts/utils/asr_batching.py and wired in by
+    # examples/asr/speech_to_text_finetune_cached.py (apply_cost_batch_sampler).
+    #
+    # Why: the joint lattice costs roughly the SQUARE of the clip duration, so a
+    # fixed batch size has to be sized for the longest clip the manifest can
+    # produce, which wastes most of the GPU on the short ones. That is what
+    # forced the old 25 s cap and threw away 81% of PARHAF's hours.
+    #
+    # cost = 4 * sum(d^2) + 6 * max(d^2), fitted on the ten measurements above:
+    # every passing one scores <= 18750 and every failing one >= 19800. The
+    # second term is the transient of the largest clip alone, because with
+    # joint.fused_batch_size 1 the joint processes one clip at a time.
+    #
+    # Measured effect on this corpus (both on the real manifests):
+    #   batches/epoch    114,459 of a flat 4   ->  63,452 of 1 to 16 (mean 7.7)
+    #   audio per batch          69 s          ->  138 s (max 234 s)
+    #   throughput        142.2 audio-s/wall-s ->  221.4 audio-s/wall-s  (+56%)
+    #   corpus kept       86.8% of hours       ->  96.6% of hours
+    #   PARHAF kept       18.6% of its hours   ->  69.0% of its hours
+    # So it is faster AND trains on more data, because the old fixed batch size
+    # was sized for a worst case that almost never occurred.
+    #
+    # Known and accepted side effect: the RNNT loss reduces with mean_batch, and
+    # gradient accumulation weights every micro-batch equally, so a batch of one
+    # 38 s clip carries the same gradient weight as a batch of sixteen short
+    # ones. Long clips are therefore upweighted about 8x per clip. That is a
+    # feature here (long-form is the weak point this fine-tune targets) but it
+    # is a real reweighting of the corpus, not a neutral change.
+    cost_batching:
+      enabled: true
+      # 15000 leaves a measured ~2.2 GB of true headroom on the worst possible
+      # batch mix. Verified two ways, because nvidia-smi lies here: it reports
+      # ~23.6 of 24.5 GB, but that is the caching allocator holding freed blocks,
+      # not need. Re-running the worst case while a second process held 1.0 GB
+      # of the card still PASSED, and the OOM messages when holding 2.0 and
+      # 2.5 GB both put the true peak at ~21.3 GiB. Budgets of 14000 and 15000
+      # report the same nvidia-smi peak, which is the giveaway.
+      # This is still the first thing to lower on an OOM.
+      budget: 15000
+      # Hard cap on clips per batch so a run of very short clips cannot build a
+      # huge one. Binds on about 13% of batches.
+      max_batch_size: 16
+      # Cap on the summed audio in a batch. The squared-duration cost above only
+      # models the joint; the encoder and preprocessor activations scale with
+      # total audio instead, and this bounds them.
+      max_total_duration: 240.0
+      # Batches are packed from windows of this many shuffled clips, sorted by
+      # duration inside the window. The encoder pads every clip up to the
+      # longest in its batch, so mixing a 3 s clip with a 39 s one would spend
+      # most of the batch on padding. Sorting inside a window rather than
+      # globally still gives different batches every epoch.
+      sort_pool_size: 512
+      seed: 42
+
+    trim_silence: false
+
+    # Max duration in seconds. With cost batching this is no longer the OOM
+    # guard (the budget is). It is the point past which a clip cannot be trained
+    # on this card even on its own: 40 s alone peaks at 23409 MiB, and 45 s
+    # alone OOMs, needing 5.18 GiB more than the card has.
+    #
+    # Tie it to the budget: a clip alone costs 10 * d^2, so the largest clip the
+    # budget can hold is sqrt(budget / 10) = 38.7 s at budget 15000. 38.0 keeps
+    # a little slack. The sampler warns at startup if any clip exceeds that, and
+    # emits it alone anyway, which may OOM, so change the two together.
+    #
+    # 38 s keeps 487,873 clips / 2,429.6 h, i.e. 96.6% of the hours, against
+    # 86.8% at the old 25 s cap. PARHAF (hospital reports, median 29.9 s) goes
+    # from keeping 18.6% of its hours to 69.0%, so long-form training data goes
+    # from 51 h to 190 h.
+    #
+    # Validation is NOT capped and still sees clips up to 44.8 s; that path runs
+    # without gradients and peaks at 17.9 GB, so it is safe.
+    max_duration: 38.0
+    min_duration: 1.0
+
+    shuffle: true
+    # 58k batches/epoch for ~10 days: workers mostly decode+resample FLAC
+    # (24->16 kHz). 8 workers on 12 cores keeps the GPU fed while leaving
+    # room for the val loaders (num_workers 2 each, non-persistent).
+    # Batches are ~2x bigger under cost batching, so each worker does more work
+    # per item and prefetch_factor 4 buys more slack than it used to.
+    num_workers: 8
+    prefetch_factor: 4
+    persistent_workers: true
+    pin_memory: true
+
+    # Inert here: NeMo only honours these two for TARRED datasets, and this run
+    # uses plain manifests. Length-aware batching comes from cost_batching above
+    # (which sorts by duration inside each sort_pool_size window).
+    bucketing_strategy: "synced_randomized"
+    bucketing_batch_size: null  # null means use batch_size
+
+    # Online data augmentation, applied on-the-fly in the dataloader
+    # workers. ACTIVE in standard (non-cached) mode - and important here:
+    # UltiMed is a single clean TTS voice, so noise/gain/RIR are the main
+    # defence against overfitting to that voice's acoustics.
+    # (Ignored only when use_cached_encoder is true.)
+    augmentor:
+      # Allowed values : dict_keys(['speed', 'time_stretch', 'gain', 'silence', 'impulse', 'shift', 'noise', 'noise_norm', 'white_noise', 'rir_noise_aug', 'transcode_aug', 'random_segment'])
+      # # White noise augmentation
+      # # Adds realism since TTS-generated audio is too clean
+      white_noise:
+        prob: 0.5  # 50% of samples get noise. Values: 0.0-1.0
+        min_level: -40  # Minimum noise level in dB. Range: -60 to -20
+        max_level: -20  # Maximum noise level in dB. Range: -40 to 0
+        # More negative = quieter noise
+        # Recommended for medical: -50 to -20 (subtle background noise)
+      # # Optional: Gain/volume perturbation (uncomment to enable)
+      # # Helps model handle different recording volumes
+      gain:
+        prob: 0.5
+        min_gain_dbfs: -10
+        max_gain_dbfs: 10
+
+      # Room impulse response augmentation
+      # Simulates different acoustic environments (rooms, halls, etc.)
+      # You need a manifest of impulse response audio files for this
+      # Download from: OpenSLR (e.g., "rir_noises" dataset) or record your own
+      impulse:
+        prob: 0.3  # 30% of samples. Adjust 0.0-1.0
+        manifest_path: "./perso/downloaded_datasets_ignore-backups/RIR/processed/rir.json"
+        shift_impulse: true
+        normalize_impulse: true
+
+  # Validation dataset configuration  
+  validation_ds:
+    # Validation runs several times per epoch (trainer.val_check_interval),
+    # so every set here is either naturally small or a seeded slice.
+    # UltiMed slices are built by perso/build_ultimed_val_slices.py (seed 42,
+    # 1-45 s filter) and live next to their source manifests on the SSD.
+    # Worker budget: 15 sets x 2 non-persistent workers, spun up only while
+    # that set validates, so they do not sit on RAM/CPU between rounds
+    # (4 persistent workers each was fine with 10 sets, not with 15).
+    # Metric names are "<name>val_wer" (e.g. ultimed_dictionaryval_wer).
+    ds_item:
+      - name: diy
+        manifest_filepath: "./perso/nemo_dataset/val.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false  # Never shuffle validation
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: drug_sentence
+        manifest_filepath: "./perso/drug_sentence_dataset/val.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false  # Never shuffle validation
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      # NOT PUBLISHED: oli_drug_sentence is a private recording of the
+      # author's own voice (205 clips reading drug names aloud) and is not
+      # shipped with this repo, so this manifest will not resolve on a fresh
+      # clone. The entries are kept because they are what the released model
+      # was actually validated and checkpoint-selected on. To run the config
+      # as-is, either drop these two blocks and the corresponding entry in
+      # exp_manager.checkpoint_callback_params, or substitute your own
+      # real-speech manifest. See README.md and perso/README.md.
+      - name: oli_drug_sentence
+        manifest_filepath: "./perso/oli_spoken_dataset/nemo_manifest_ordered_uncapitaliazedDCI.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false  # Never shuffle validation
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      # ---- UltiMed-ASR-FR seeded validation slices ----------------------
+      - name: ultimed_dictionary
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/dictionary/val.down-600.jsonl"
+        sample_rate: 16000
+        batch_size: 4  # clips reach the 45 s cap; keep the loss lattice bounded
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: ultimed_parhaf
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/PARHAF/val.down-300.jsonl"
+        sample_rate: 16000
+        batch_size: 2  # long-form hospital reports, many near 45 s
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: ultimed_drugs
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/drugs/val.down-300.jsonl"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: ultimed_acronyms
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/acronyms/val.down-150.jsonl"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      # PARROT: eval-only subset (CC BY-NC-SA), never trained on. Sliced
+      # from ITS TEST SPLIT and used as an out-of-domain radiology monitor.
+      - name: ultimed_parrot
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.down-200.jsonl"
+        sample_rate: 16000
+        batch_size: 2  # long-form radiology reports
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+      # --------------------------------------------------------------------
+
+      - name: fleurs_de
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/de/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: fleurs_en
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/en/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: fleurs_fr
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/fr/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: fleurs_fi
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/fi/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: fleurs_it
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/it/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: fleurs_sv
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/sv/validation.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      # Eval-only since the UltiMed run (CC BY-SA, excluded from training);
+      # kept here to watch for regression on English medical speech.
+      - name: united_syn_med
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/united_syn_med/validation/val.kept.unparenthesized.down-2k.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+  # Test dataset configuration
+  test_ds:
+    # manifest_filepath must exist at top level because the finetune script
+    # checks `test_ds.manifest_filepath is not None` to decide whether to
+    # run testing. Set to null to skip auto-test; use ds_item for manual eval.
+    manifest_filepath: null
+    ds_item:
+      # Full UltiMed test split: 57,668 clips / ~310 h across all sources.
+      # Far too big to run during training; for one-shot manual eval only.
+      - name: ultimed_full
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/test.jsonl"
+        sample_rate: 16000
+        batch_size: 4
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      # Full PARROT test split (eval-only subset, real anonymised radiology)
+      - name: ultimed_parrot_full
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.jsonl"
+        sample_rate: 16000
+        batch_size: 2
+        shuffle: false
+        num_workers: 2
+        persistent_workers: false
+        pin_memory: true
+        prefetch_factor: 2
+
+      - name: diy
+        manifest_filepath: "./perso/nemo_dataset/test.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: drug_sentence
+        manifest_filepath: "./perso/drug_sentence_dataset/test.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      # Only 205 clips and no dedicated test split, so the same manifest is
+      # used for both validation and test.
+      # NOT PUBLISHED: oli_drug_sentence is a private recording of the
+      # author's own voice (205 clips reading drug names aloud) and is not
+      # shipped with this repo, so this manifest will not resolve on a fresh
+      # clone. The entries are kept because they are what the released model
+      # was actually validated and checkpoint-selected on. To run the config
+      # as-is, either drop these two blocks and the corresponding entry in
+      # exp_manager.checkpoint_callback_params, or substitute your own
+      # real-speech manifest. See README.md and perso/README.md.
+      - name: oli_drug_sentence
+        manifest_filepath: "./perso/oli_spoken_dataset/nemo_manifest_ordered_uncapitaliazedDCI.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_bg
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/bg/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_cs
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/cs/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_da
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/da/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_de
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/de/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_el
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/el/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_en
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/en/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_es
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/es/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_et
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/et/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_fi
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/fi/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_fr
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/fr/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_hr
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/hr/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_hu
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/hu/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_it
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/it/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_lt
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/lt/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_lv
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/lv/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_mt
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/mt/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_nl
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/nl/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_pl
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/pl/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_pt
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/pt/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_ro
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/ro/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_ru
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/ru/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_sk
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/sk/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_sl
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/sl/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_sv
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/sv/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: fleurs_uk
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/fleurs/uk/test.altered.json"
+        sample_rate: 16000
+        batch_size: 6
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+      - name: united_syn_med
+        manifest_filepath: "./perso/downloaded_datasets_ignore-backups/united_syn_med/test/test.kept.unparenthesized.down-2k.json"
+        sample_rate: 16000
+        batch_size: 6  # reduced from 8 — OOM on validation at end of epoch 1
+        shuffle: false
+        num_workers: 4
+        persistent_workers: true
+        pin_memory: true
+        prefetch_factor: 4
+
+  # Optimizer configuration
+  optim:
+    # AdamSPD: Adam with Selective Projection Decay (GT-RIPL).
+    # Instead of standard weight decay (pulls toward zero) or L2-SP
+    # (blanket penalty toward pretrained), SPD selectively decays
+    # weights toward pretrained values *only when the gradient pushes
+    # them further away*. This prevents forgetting while allowing
+    # beneficial updates. The weight_decay parameter controls the
+    # SPD decay strength (higher = stronger pull toward pretrained).
+    # MEASURED, not assumed (1.3.0-nospd ablation, 2026-08-28): swapping in
+    # plain AdamW on 1.3.0's exact LR trajectory, seed and data order left
+    # the fleurs canaries unchanged (fr+en macro delta -0.05, noise) but
+    # lost in-domain generalisation, with the gap growing every round:
+    # 4-set avg 6.94 vs 6.22 at step 5000 (oli_drug +2.03, parhaf +0.33,
+    # dictionary +0.31, drugs +0.22), macro 8.09 vs 7.63, and the AdamW arm
+    # had already turned over (4000 -> 5000 worsened) while SPD was still
+    # improving. So on this corpus SPD's anchored selective decay is doing
+    # its work as a regulariser that helps held-out in-domain performance,
+    # not just as an anti-forgetting brake. Kept, unscoped: encoder-only
+    # scoping would need a code change (unregistered params decay toward
+    # zero, see adam_spd.py) and the all-params version is already winning
+    # on the monitored metric.
+    _target_: nemo.collections.asr.optim.adam_spd.AdamSPD
+
+    # Learning rate - critical hyperparameter
+    # Adjust based on performance
+    # Recommended for fine-tuning: 1e-5 to 5e-5
+    # Lower (1e-5): More stable, safer for fine-tuning, slower convergence
+    # Higher (5e-5): Faster convergence, risk of catastrophic forgetting
+    lr: 2e-5
+
+    # Adam parameters
+    betas: [0.9, 0.999]
+    # SPD decay strength — controls how strongly weights are pulled
+    # back toward pretrained values (only when gradient diverges).
+    # This replaces both AdamW weight_decay and L2-SP lambda.
+    weight_decay: 0.01
+
+    # Learning rate scheduler
+    # Choose scheduler type and parameters
+    sched:
+      name: CosineAnnealing
+
+      # Warmup steps - gradually increase LR from 0 to lr
+      # Counted in OPTIMIZER steps (= batches / accumulate_grad_batches).
+      # Measured in 1.4.0 with the CV rehearsal: 76,152 batches / accum 8
+      # = 9,519 opt-steps per epoch.
+      # 800 warmup steps = ~8% of the first epoch, about 40 min of ramp,
+      # gentle on the newly-unfrozen encoder layers.
+      warmup_steps: 800
+
+      # Cosine horizon, in optimizer steps. Explicitly set so the anneal lands
+      # at the end of the run instead of being cut off mid-decay.
+      #
+      # Recalibrated for cost batching, from a measured 1.604 batches/s on the
+      # real manifests (was 2.07 with fixed batches of 4, but each batch now
+      # carries twice the audio):
+      #   1.604 * 864000 s / 8 accum = 173,000 opt-steps of pure training
+      # less ~4% for validation passes and checkpoint writes -> ~166,000 in
+      # 10 days.
+      #
+      # THIS IS THE TRAINING-LENGTH DECISION, not a safety limit: it sets the
+      # SHAPE of the cosine. At ~8,910 opt-steps per epoch, 15,000 steps is
+      # ~1.7 epochs, inside the max_epochs 2 ceiling below. Setting
+      # this longer than the run actually goes is actively harmful: the best
+      # checkpoint then gets taken mid-anneal at a high LR, having never had
+      # its final decay, and a completed cosine at N epochs beats a cosine
+      # truncated at N-of-20. Setting it shorter just parks the tail of the
+      # run at min_lr (stable, simply no further annealing).
+      #
+      # 15,000 (measured: 1.58 epochs of the enlarged corpus), up from
+      # 10,000 in 1.3.0; before that 23,800 in 1.2.0 and 95,178 in 1.1.0.
+      #
+      # The short-cosine idea was the central change in 1.3.0 and it worked:
+      # no drift phase, the endpoint WAS the best point (7.21). Both earlier
+      # runs had put their best macro under one and a half epochs (1.1.0 at
+      # step 7,500 = 7.08; 1.2.0 at 15,432 = 9.61, still flattening) because
+      # the corpus is a single TTS system whose hour count overstates its
+      # acoustic diversity: extra passes mostly teach the model that one
+      # voice, so the optimum arrives early and everything after it is drift.
+      #
+      # 1.1.0 hit that optimum with the LR still at peak, because the cosine
+      # was sized for 12 epochs: (7500-800)/(95178-800) = 7% through, so LR was
+      # 1.99e-5 of a 2e-5 peak. Its best checkpoint never got a final decay,
+      # and the run then spent 32 hours annealing past the point it should have
+      # stopped at, without saving a single further top-k checkpoint.
+      #
+      # Why 15,000 now and not 10,000 again: 1.3.0 was still improving at its
+      # stop (~0.04 macro per 1,000 steps), so 10k was slightly short even on
+      # the old data, and 1.4.0's corpus is both ~12% larger and genuinely
+      # more diverse (Common Voice is real multi-speaker speech, not TTS), so
+      # the early-optimum argument above has less bite. ~1.7 epochs keeps the
+      # anneal landing on the same window per-epoch-wise while giving the
+      # rehearsal mix time to work. (Post-run: it was right-sized, the best
+      # checkpoint landed at 11,519 inside a flat 10.5k-14.5k plateau.)
+      # Kept equal to trainer.max_steps below,
+      # which is what actually ends the run; the config audit fails the run
+      # if the two disagree.
+      max_steps: 15000
+
+      # Minimum learning rate at end of training
+      # Set to 0 for full annealing, or 0.1*lr to keep some learning
+      min_lr: 2e-6
+
+      # For ReduceLROnPlateau (alternative scheduler):
+      # name: ReduceLROnPlateau
+      # mode: min
+      # factor: 0.5
+      # patience: 3
+      # min_lr: 1e-6
+
+  # SpecAugment - augmentation on spectrograms
+  # This operates on mel-spectrograms, not raw audio
+  # Very effective for ASR robustness
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+
+    # Frequency masking - masks out frequency bands
+    freq_masks: 2  # Number of frequency bands to mask
+    freq_width: 25  # Maximum width of each mask
+
+    # Time masking - enabled for the UltiMed run: single TTS voice with
+    # very regular pacing makes time-structure overfitting likely.
+    # Float time_width = adaptive, each mask up to 5% of the utterance
+    # (FastConformer recipes use 10 x 0.05; 5 is a gentler fine-tune dose).
+    time_masks: 5
+    time_width: 0.05
+
+    # Cutout rectangles - random rectangular masks
+    # rect_masks: 1  # Number of rectangles
+    # rect_time: 5  # Max time dimension
+    # rect_freq: 15  # Max frequency dimension
+
+# Trainer configuration (PyTorch Lightning)
+trainer:
+  # GPU settings
+  devices: 1  # Single GPU
+  accelerator: gpu
+
+  # DeepSpeed DROPPED for the UltiMed run. It only paid off when nearly
+  # everything trained; now only ~120M params train, so optimizer state is
+  # ~1.5 GB on GPU and the offload's PCIe traffic + engine overhead would
+  # just slow down a 10-day run. Plain single-GPU strategy.
+  # (To re-enable: strategy: deepspeed_stage_2_offload)
+  strategy: auto
+
+  # Training duration: WALL CLOCK is the real budget.
+  # max_time stops cleanly mid-epoch when the budget is spent (Lightning
+  # format "DD:HH:MM:SS"). CAVEAT: the timer counts time of the CURRENT
+  # process only; it resets on every crash-relaunch/resume, so with the
+  # relaunch wrapper the true total is "10 days of cumulative uptime since
+  # the last crash" per launch. Shrink it on relaunches if you need a hard
+  # calendar deadline.
+  max_time: "10:00:00:00"
+  # THE BINDING STOP. Lightning halts at whichever of max_steps and
+  # max_epochs arrives first, and at the measured 9,519 opt-steps per epoch
+  # this lands at 1.58 epochs, before max_epochs. Kept equal to optim.sched.max_steps so
+  # the cosine finishes exactly as the run does: change one and you must change
+  # the other. The config audit compares them and fails the run if they drift.
+  #
+  # Measured on 1.3.0: 1.358 batches/s including validation and checkpoints,
+  # so 15,000 opt-steps (120,000 batches) is ~24.5 h.
+  #
+  # Freezing the encoder did NOT speed 1.2.0 up, contrary to what was expected
+  # here before it was measured: 1.1.0 ran at ~1.50 batches/s with the same
+  # N=4 this run uses. The encoder forward still runs in full, and the TDT
+  # joint lattice ([B, T, U, V] at V=8198) dominates the step either way, so
+  # skipping the encoder backward buys little. Do not assume a smaller
+  # trainable set means a faster epoch. N=4 is also exactly 1.1.0's memory
+  # profile, which ran 30+ h at these batch settings without an OOM. The CV
+  # rehearsal clips are short (~5 s mean, 38 s cap applies regardless), so
+  # they cannot produce a worse batch than the cost model was fitted on.
+  max_steps: 15000
+
+  # A ceiling only, never reached: max_steps above stops the run first. Left
+  # above the real budget on purpose so that raising max_steps does not
+  # silently truncate against an epoch limit nobody remembered to move.
+  #
+  # No early stopping is configured. save_top_k below is what protects the
+  # result: the best checkpoint is kept whenever it occurs.
+  max_epochs: 2
+
+  # Precision - use 16-bit mixed precision for memory efficiency
+  # This uses automatic mixed precision (AMP)
+  precision: bf16-mixed
+
+  # Gradient clipping - prevents exploding gradients
+  gradient_clip_val: 1.0
+
+  # Gradient accumulation - simulates larger batches
+  # If you want effective batch_size of 32 but actual batch_size of 8:
+  # set accumulate_grad_batches: 4
+  # This updates weights every 4 batches
+  # Pros: Trains like larger batch without VRAM cost
+  # Cons: 4x slower weight updates
+  #
+  # Lowered from 16 to 8 to keep the optimizer step the same size as before
+  # cost batching: batches now hold 7.7 clips on average instead of 4, so
+  # 8 x 7.7 = 62 clips and 1104 audio-s per step, against 16 x 4 = 64 clips
+  # and 1100 audio-s before. Same optimization dynamics, different batching.
+  accumulate_grad_batches: 8
+
+  # Validation settings
+  # An epoch is ~11 h, so epoch-boundary validation is too coarse here.
+  # Integer value = every N TRAINING BATCHES (not optimizer steps).
+  #
+  # 20000 in 1.1.0, 10000 in 1.2.0, 8000 since 1.3.0. The run is now 120,000
+  # batches total, so 8000 gives one round per 1,000 opt-steps (14 rounds in
+  # 1.4.0, not 15: the counter resets at the epoch boundary, which swallowed
+  # the round at step 10000), with the last few inside the low-LR tail where
+  # the best checkpoint is expected (1.3.0: endpoint was best; 1.4.0: best at
+  # 11,519 of 15,000).
+  #
+  # Resolution matters because the optimum is a window that can be stepped
+  # over. 1.1.0's macro bottomed at step 7,500, inside the first epoch,
+  # between two rounds 20,000 batches apart.
+  #
+  # A full 15-set validation pass measures 4.5 min (246/289/283 s over 1.1.0's
+  # three in-epoch rounds), so 14 rounds cost ~63 min of the ~24 h run. Must
+  # stay < batches per epoch (measured 76,152 under cost batching with the CV
+  # rehearsal) or Lightning errors out at startup.
+  val_check_interval: 8000
+
+  # Disable Lightning's built-in logger so NeMo's exp_manager can create
+  # its own (tensorboard). Having both causes LoggerMisconfigurationError.
+  logger: false
+
+  # Disable Lightning's built-in checkpointing so NeMo's exp_manager can
+  # manage checkpoints itself (see exp_manager.checkpoint_callback_params).
+  enable_checkpointing: false
+
+  # Deterministic training for reproducibility
+  # Note: This may slightly slow down training
+  deterministic: false
+
+  # Logging
+  log_every_n_steps: 50
+
+  # Benchmarking - set false for deterministic training
+  benchmark: false
+
+  # Number of sanity validation steps at start
+  # Useful for catching errors before full training
+  num_sanity_val_steps: 2
+
+# https://docs.nvidia.co./perso/nemo-framework/user-guide/lates./perso/nemotoolkit/asr/configs.html
+decoding:
+  # Greedy (not maes/beam search) on purpose. This decoding runs on every
+  # validation step, so we want it fast: greedy is a single forward pass per
+  # frame, while maes beam search is several times slower. The val_wer we
+  # monitor only needs to track relative progress between checkpoints, and
+  # greedy vs beam barely changes that ranking. Save maes for final inference
+  # where the small accuracy gain is worth the extra compute.
+  #
+  # Measured on this exact model rather than assumed: on the FLEURS French
+  # validation split, fp32 scores 4.90% WER greedy against 4.87% with MAES
+  # beam 10, a 0.03 point difference. Beam over 6,395 validation clips x 38
+  # rounds would add 9-18 h to the run for an offset far too small to reorder
+  # any checkpoint.
+  #
+  # greedy_batch, not greedy: same output, batched across the utterances in a
+  # validation batch instead of one at a time. Plain `greedy` here would be a
+  # pure slowdown for identical results.
+  #
+  # WIRING NOTE: this block was read by NOTHING until 2026-08-23. The model
+  # comes from ASRModel.from_pretrained(), which restores the checkpoint's own
+  # config, so decoding was silently inherited from the .nemo (which happened
+  # to specify greedy_batch/max_symbols 10, so the effective behaviour was
+  # right by luck). main() now applies it explicitly via
+  # change_decoding_strategy, so this block is genuinely in control. Putting
+  # it under model: would NOT work: from_pretrained overwrites that.
+  strategy: greedy_batch
+  model_type: tdt
+  durations: [0, 1, 2, 3, 4]
+  greedy:
+    # Cap on symbols emitted per encoder frame, the RNNT infinite-loop guard.
+    # 10 is the value the pretrained checkpoint ships with.
+    max_symbols: 10
+
+# Log a punctuation- and case-insensitive WER next to the raw one, for every
+# validation set and every macro below (<name>val_wer_norm and
+# <macro>_norm, generated automatically so the source lists cannot drift).
+#
+# NeMo scores reference.split() against hypothesis.split(), so formatting
+# counts as recognition error, and because split() keeps punctuation glued to
+# its word a single comma costs a whole word:
+#     reference   "... pancréatique exocrine, ainsi que ..."
+#     hypothesis  "... pancréatique exocrine ainsi que ..."   one substitution
+# Measured over 128,649 pairs from the 1.1.0 log: 15.89% raw against 13.79%
+# normalised, so 2.10 points (13% relative) of every WER here is formatting.
+#
+# Both are logged and neither is "the" number: raw is what a reader sees on
+# screen, normalised is what the model knows about the words. The checkpoint
+# monitor stays on the RAW macro so curves stay comparable with 1.1.0.
+#
+# Note this does NOT expand numbers ("3" vs "trois"), a real error source in
+# these transcripts, because doing it properly needs a French verbaliser and
+# half-normalising would be worse than leaving it alone.
+#
+# Predecessor: train_ds.multitask_metrics_config asked for a WERNormalised via
+# _target_. It never ran. Nothing in the codebase reads multitask_metrics_config
+# (it is an AED/multitask key, and this is an RNNT model), and the module it
+# pointed at was a symlink to a deleted file. Both failures were invisible
+# because model.train_ds is a delegated subtree the config audit does not
+# descend into. This replaces it with a path that actually executes.
+normalised_wer: true
+
+# Extra metrics computed as plain averages of already-logged validation
+# metrics. Implemented by _MacroMetricCallback in
+# examples/asr/speech_to_text_finetune_cached.py, which writes the result
+# into trainer.callback_metrics so it can serve as the checkpoint monitor.
+macro_metrics:
+  # Checkpoint monitor for the UltiMed run: equal-weight macro of the two
+  # FLEURS anchors (multilinguality / forgetting guard), the three main
+  # in-domain UltiMed slices, and oli (see below). A gain on medical French
+  # only counts if it does not cost general FR/EN. acronyms (tiny, noisy) and
+  # parrot (out-of-domain, never trained) are tracked but kept out of the
+  # monitor.
+  #
+  # oli_drug_sentence carries weight here despite being the smallest set,
+  # because it is the ONLY real recorded human speech in the whole setup that
+  # is also in-domain. Every training hour is synthetic (98.7% a single
+  # Voxtral fr_female voice), and FLEURS is real but general rather than
+  # medical, so without oli nothing in the monitor measures the actual
+  # deployment condition: a human saying drug names. A checkpoint chosen
+  # without it is chosen on TTS performance alone.
+  #
+  # Caveat to read it with: 205 clips / 30 min is a small sample, so its WER
+  # is the noisiest component of the macro. It is one of six voices here
+  # rather than the monitor on its own for exactly that reason, and
+  # save_top_k: 5 leaves room to compare the finalists on oli directly.
+  - name: "combined_macro_val_wer"
+    sources:
+      - "fleurs_frval_wer"
+      - "fleurs_enval_wer"
+      - "ultimed_dictionaryval_wer"
+      - "ultimed_parhafval_wer"
+      - "ultimed_drugsval_wer"
+      - "oli_drug_sentenceval_wer"
+  # Kept for comparability with previous runs' tensorboards.
+  - name: "fleurs_fr_en_macro_val_wer"
+    sources: ["fleurs_frval_wer", "fleurs_enval_wer"]
+
+# Experiment manager - handles logging, checkpointing, etc.
+# documentation: https://github.com/NVIDIA-NeM./perso/nemo/blob/412ab81dd5b17f763ee3aa723c67679698649a7./perso/nemo/utils/exp_manager.py
+exp_manager:
+  # Full layout: <exp_dir>/<exp_manager.name>/<version>/checkpoints/
+  #
+  # Left unset, exp_manager defaults this to "default", which is what runs used
+  # to land under. That made the top-level `name:` pure decoration and meant
+  # anything else ever trained on the same disk piled into the same directory
+  # with only the version string telling runs apart. Pointed at ${name} on
+  # 2026-08-23, while nemo_experiments/ was still empty so nothing had to move.
+  # Changing it once a run has started would strand its checkpoints: resume
+  # looks in <exp_dir>/<name>/<version>/checkpoints and would find an empty
+  # directory, then restart from scratch without saying so.
+  name: ${name}
+
+  # Where checkpoints, .nemo files and tensorboard logs are written.
+  # Set NEMO_EXP_DIR to put runs on another disk (checkpoints are several GB
+  # each, and save_top_k + save_last + always_save_nemo multiplies that):
+  #   NEMO_EXP_DIR=/mnt/spare_disk/nemo_experiments python examples/asr/...
+  # Unset -> ./nemo_experiments, the historical location.
+  # Kept as an env var rather than a hardcoded path so the config stays
+  # machine-independent.
+  # NOTE: resume_if_exists (below) looks inside this directory, so pointing it
+  # at an empty disk means past runs are not found for resuming. Move the
+  # existing nemo_experiments/ over if you want them to remain resumable.
+  exp_dir: ${oc.env:NEMO_EXP_DIR,./nemo_experiments}
+
+  # Checkpointing configuration
+  # 1.x.x = the UltiMed-ASR-FR era (0.x.x was the drug_sentence/diy era).
+  # The minor number is the training recipe, so it moves whenever the thing
+  # being tested changes; the patch number is for fixes that do not.
+  #
+  # 1.0.0  first UltiMed retarget (25 s cap, fixed batch_size 4). Never run.
+  # 1.1.0  cost batching (38 s cap, adaptive batch, oli_drug_sentence in
+  #        val/test), encoder last 4 layers unfrozen, 12 epochs. Ran
+  #        2026-08-24 to 08-26, stopped after 4.6 epochs: in-domain hit its
+  #        noise floor by epoch 2 while English WER climbed 148%. Best macro
+  #        7.08% at step 7,500. Its checkpoints are kept for comparison.
+  # 1.2.0  encoder fully frozen, 3 epochs, validation twice as often. Tested
+  #        whether the in-domain gain survives without encoder plasticity.
+  #        Answer: not far enough. Forgetting fell to a seventh of 1.1.0's,
+  #        but the macro flattened at 9.61, worse than 1.1.0's WORST point
+  #        (9.11). Stopped after 1.95 epochs at step 15,432.
+  # 1.3.0  back to 1.1.0's N=4 freeze; the change is the schedule. The run is
+  #        sized to 10,000 opt-steps (1.26 epochs) so the cosine anneals onto
+  #        the window both earlier runs pointed at instead of driving past it.
+  #        First run to log the normalised WER alongside the raw one.
+  #        Outcome: no drift phase, the endpoint IS the best point, but 7.21
+  #        against 1.1.0@7500's 7.08: in-domain 5.67 vs 5.38, fleurs fr+en
+  #        10.31 vs 10.47. Still falling ~0.04/1000 steps at the stop, so 10k
+  #        was slightly short. Norm columns: macro 5.04, in-domain ~4.05.
+  # 1.3.0-nospd  ablation arm, launched by perso/run_ablation_nospd.sh via
+  #        hydra overrides (this file is not modified): AdamW instead of
+  #        AdamSPD, truncated at 5,000 opt-steps on 1.3.0's exact LR
+  #        trajectory, so steps 1000-5000 compare point for point against
+  #        1.3.0's curve. Measures what SPD actually contributes.
+  #        Outcome: fleurs unchanged (fr+en macro -0.05, noise) but clearly
+  #        worse in-domain with a growing gap (4-set avg 6.94 vs 6.22 at
+  #        step 5000, macro 8.09 vs 7.63) and already degrading by the end.
+  #        Verdict: AdamSPD kept; see the optim block for the full numbers.
+  # 1.4.0  rehearsal + longer anneal, optimizer settled by the ablation.
+  #        Adds 300 h of Common Voice 22.0 (200 fr + 100 en, ~11% of
+  #        audio-seconds, replay of pretraining data) against the forgetting
+  #        seen on fleurs-EN and unmonitored languages (1.3.0: sv +2.9,
+  #        fi +4.0), and stretches the run to 15,000 opt-steps (~1.7 epochs
+  #        of the enlarged corpus, ~24.5 h) since 1.3.0 was still improving
+  #        at its 10k stop. Everything else inherits from 1.3.0.
+  #        Outcome (2026-08-29, one launch, ~24 h): NEW OVERALL BEST, macro
+  #        6.68 @ step 11519 (norm 4.56) vs 7.08 for 1.1.0 and 7.21 for
+  #        1.3.0; plateau 10.5k-14.5k, endpoint 6.74, so 15k was right-sized
+  #        (optimum inside the low-LR tail, no drift). Rehearsal cost nothing
+  #        in-domain: 4-set avg 5.52 vs 5.67 (1.3.0). fleurs fr 8.48 / en
+  #        9.56, both at-or-below the pretrained baseline (8.55 / 10.38), so
+  #        CV replay erased the fr+en forgetting outright; those two are now
+  #        near-in-distribution rather than strict canaries, the clean ones
+  #        being de/it/sv/fi + united_syn_med. Of those, it/de/united stayed
+  #        ~flat but sv (20.2 -> 22.4) and fi (19.3 -> 23.1) still slid:
+  #        rehearsal only protects what it covers. Measured epoch = 76,152
+  #        batches = 9,519 opt-steps, so 15k = 1.58 epochs and the epoch-
+  #        boundary val-counter reset made 14 rounds, not 15 (no round at
+  #        10000; first epoch-1 round at 10519). .nemo export = best @ 11519.
+  # 1.5.0  extends CV rehearsal to the four remaining monitored languages
+  #        (de 20.0 h, it 20.0 h, sv-SE 9.1 h, fi 2.6 h; the last two are
+  #        their full CV train pools), targeting the sv/fi slide that fr/en
+  #        replay could not reach in 1.4.0. Rehearsal now 351.7 h = 12.6%
+  #        of audio-seconds; UltiMed share 86.2%. Everything else inherits
+  #        from 1.4.0: same 15k steps (the 10.5k-14.5k plateau showed the
+  #        budget is right-sized, and the corpus grew only ~1.9%), same
+  #        AdamSPD, same monitor. Estimated ~9,700 opt-steps/epoch, so
+  #        ~1.55 epochs and again 14 val rounds. Launched overnight
+  #        2026-08-30 by the user's timer after a green dry-run audit.
+  #        Outcome (2026-08-31, one launch, 22.0 h, measured 78,342
+  #        batches/epoch = 9,793 opt-steps): mission accomplished on the
+  #        target languages at zero in-domain cost, but the MONITORED metric
+  #        cannot see it. combined_macro (whose sources are only the 4
+  #        in-domain sets + fleurs fr/en) read 6.78 @ 11793 vs 6.68 for
+  #        1.4.0; decomposition: in-domain 4-set 5.55 vs 5.52 (tie), fr
+  #        +0.35, en +0.09 (run-to-run noise scale). Meanwhile the pinned
+  #        languages, logged but OUTSIDE the macro: fi 18.6 endpoint vs 23.1
+  #        (-4.5, back at its pre-finetune level from 2.6 h of replay), sv
+  #        20.2 vs 22.4 (-2.2, likewise flat all run), de 10.1 vs 10.6
+  #        (-0.5), it unchanged. Averaged over all 15 logged sets 1.5.0 is
+  #        clearly the better model; on the 6-source monitor it looks 0.10
+  #        worse. Lesson for 1.6.0: add a fleurs_macro over all six fleurs
+  #        sets (observability) and consider a balanced monitor so
+  #        checkpoint selection sees what rehearsal protects. .nemo export
+  #        = best @ 11793.
+  #
+  # This is also the run directory name, so a new value starts a clean run and
+  # leaves the previous one resumable.
+  version: "1.5.0"
+
+  # Only save the best model based on validation CER
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    # NeMo names the WER metric "val_wer" and prefixes the per-dataset
+    # variants: diyval_wer, drug_sentenceval_wer, etc. The normalised twins add
+    # a _norm suffix (see normalised_wer below) and are logged, not monitored.
+    # Monitor the combined macro (see macro_metrics above): FLEURS FR+EN
+    # anchors + the three main UltiMed slices. A French-only or in-domain-only
+    # monitor is blind to language tipping: training data is ~99% French TTS,
+    # so the model could drift its language prior toward French and look
+    # great in-domain while regressing elsewhere. (Same failure mode hit
+    # during the SmoothQuant calibration of this model, where degraded
+    # English embeddings tipped outputs into English; see the HF repo linked
+    # in the latent_augment section.)
+    monitor: "combined_macro_val_wer"
+    mode: min  # Lower is better
+    # 5 rather than 2: with no early stopping the run goes the full 12 epochs,
+    # so keeping a wider band of the best checkpoints leaves room to compare
+    # them afterwards (and to average them) instead of trusting one val point.
+    # ~3.2 GB each, so 5 + last + the .nemo export is ~22 GB.
+    save_top_k: 5
+    save_last: true
+    save_best_model: true
+    # {step} is REQUIRED: validation runs many times per epoch, so an
+    # epoch-only filename would collide/overwrite across rounds.
+    filename: "parakeet-tdt-ultimed-{epoch}-{step}-{combined_macro_val_wer:.4f}"
+    always_save_nemo: true  # Save as .nemo format
+
+  # Logging
+  create_tensorboard_logger: true
+  create_wandb_logger: false
+
+  # Resume from checkpoint on crash
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  # resume_from_checkpoint: path/to/checkpoint
+
+
+# ============================================================================
+# CONFIG AUDIT
+# ============================================================================
+# Crash before trainer.fit() if this file does not mean what it says.
+#
+# It exists because six settings here turned out to be inert, and every one of
+# them looked perfectly fine in the YAML:
+#   optim.weight_decay        read, but AdamSPD's maths ignored it
+#   decoding (top level)      read by nothing; strategy inherited from the .nemo
+#   cache_variants_per_sample at the top level, consumer reads model.*, so 1 not 6
+#   model.seed                no consumer at all, the run was unseeded
+#   bucketing_strategy        tarred-datasets only
+#   persistent_workers        accepted here, dropped by NeMo's train dataloader
+#
+# Two checks, because no single one catches all three failure modes:
+#   Layer 1 records every key actually read during setup and crashes on any
+#           that were not. Catches wrong nesting level, typos, dead consumers.
+#   Layer 2 re-reads the settings that matter back off the objects that were
+#           built (decoder, optimizer, batch sampler, dataloaders) and crashes
+#           on any that did not survive. Catches read-then-discarded.
+# A third mode, wired-but-inert (the weight_decay bug), is invisible to both
+# and needs a behavioural test: tests/collections/asr/test_adam_spd.py.
+#
+# Both run after setup and before the first training step, so a false positive
+# costs a two-minute restart rather than days.
+config_audit:
+  enabled: true
+
+  # A/B escape hatch. An ablation arm that must replicate a longer run's LR
+  # trajectory keeps that run's optim.sched.max_steps and truncates with
+  # trainer.max_steps instead, so its mid-run validation points compare like
+  # for like against the reference curve. That mismatch is exactly what the
+  # schedule-coherence check exists to catch, so it has to be acknowledged
+  # here, per run, from the launcher (perso/run_ablation_nospd.sh does). Only
+  # the truncation direction is excusable; a cosine shorter than the run still
+  # fails. Leave false for every real training run.
+  allow_truncated_anneal: false
+
+  # Keys that are legitimately unread. Each one is an assertion that the key is
+  # dead *on purpose*, so keep the reason attached. A trailing '.*' exempts a
+  # subtree. Anything not listed here crashes the run.
+  allow_unused:
+    # --- covered by layer 2 instead of layer 1 ---
+    # change_decoding_strategy copies the block before reading it, so layer 1
+    # cannot see these reads. Layer 2 checks all four against the live decoder
+    # object (strategy, model_type, durations, and max_symbols on the greedy
+    # decoder itself), which is stronger evidence than a read record anyway.
+    - decoding.model_type
+    - decoding.durations
+    - decoding.greedy.max_symbols
+
+    # --- inert while use_cached_encoder is false ---
+    # The whole cached-encoder path is off, so nothing reads its settings.
+    # Flip use_cached_encoder to true and these must come back off this list.
+    - encoder_cache_dir
+    - encoder_cache.*
+    - model.latent_augment.*
+
+    # --- read by a different script ---
+    # Only perso/precompute_encoder_cache.py consumes this, and only when
+    # building a cache. Training never reads it.
+    - model.cache_variants_per_sample
+
+    # --- consumed, but through an interpolation layer 1 cannot see ---
+    # exp_manager.name is ${name}, and OmegaConf resolves interpolations via
+    # _get_node, which bypasses the three read paths the audit patches. So this
+    # key is genuinely used and still never shows up as read. Layer 2 checks the
+    # run directory the trainer actually got and fails if the name is missing
+    # from it, which is what keeps this entry honest.
+    - name

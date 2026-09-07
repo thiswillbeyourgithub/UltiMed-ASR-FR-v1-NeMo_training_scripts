@@ -186,3 +186,18 @@ slurm*.out
 node_modules/
 .vite/
 bot_server.*
+
+
+.aider*
+perso/nemo_dataset/*wav
+perso/drug_sentence_dataset/*wav
+perso/downloaded_datasets_ignore-backups
+perso/encoder_cache_ignore_backups
+lightning_logs
+.serena
+.tokensave
+perso/grid_stitch_datasets/
+# Timestamped training logs written by training_start.sh, and the symlink to the
+# dataset drive (its target embeds the username, so it must never be tracked).
+perso/training_logs_ignore-backups/
+perso/ultimed_data_ignore-backups
