@@ -214,3 +214,7 @@ perso/exports/ultimed/
 perso/benchmark_results.jsonl
 perso/benchmark_results.md
 perso/eval_results.jsonl
+
+# Agent scratch files. Excluded globally on my machine too, but that does not
+# travel with the repo, so pin it here.
+.claude/
