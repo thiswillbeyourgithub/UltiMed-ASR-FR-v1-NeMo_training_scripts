@@ -13,16 +13,30 @@ the released model was trained on. The branch has deliberately **not** been reba
 NeMo: the patches below were never tested against anything else, and the point of this repo is to
 record what actually ran.
 
+## Contents
+
+- [Related repositories](#related-repositories)
+- [What each patch does](#what-each-patch-does)
+- [Reproducing](#reproducing)
+- [Reading the tree](#reading-the-tree)
+- [What is deliberately not in this repo](#what-is-deliberately-not-in-this-repo)
+- [Credits and licence](#credits-and-licence)
+
 ## Related repositories
 
-| What | Where |
-|---|---|
-| The fine-tuned model (ONNX, fp32 / fp16 / int8 / w4a8) | [huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx) |
-| The training dataset | [huggingface.co/datasets/Olicorne/UltiMed-ASR-FR-v1](https://huggingface.co/datasets/Olicorne/UltiMed-ASR-FR-v1) |
-| Scripts that built that dataset | [github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-scripts](https://github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-scripts) |
-| The TTS container that synthesised its audio | [github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-Voxtral](https://github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-Voxtral) |
-| The un-finetuned baseline, same ONNX optimisations | [huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx) |
-| Upstream base model | [huggingface.co/nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
+This fork is one piece of a French medical ASR stack; every other piece is public.
+
+| Repository | What it is |
+| --- | --- |
+| [Parakeet Web](https://github.com/thiswillbeyourgithub/parakeet_web) | The in-browser ASR app that loads either ONNX model, live at [parakeetweb.olicorne.org](https://parakeetweb.olicorne.org/). Everything runs client-side. |
+| [Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx) | The multilingual baseline: the upstream ONNX re-quantized for int8 accuracy on long audio and graph-optimized for browser speed. |
+| [Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx) | The French medical fine-tune of that baseline, exported to ONNX (fp32 / fp16 / int8 / w4a8). |
+| [Olicorne/UltiMed-ASR-FR-v1](https://huggingface.co/datasets/Olicorne/UltiMed-ASR-FR-v1) | The dataset the fine-tune was trained on: 601,338 clips / 3,105 h of synthesized French medical speech, plus an eval-only PARROT subset. |
+| [UltiMed-ASR-FR-v1-scripts](https://github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-scripts) | The open recipe that built that dataset end to end: text sources, spoken-form normalization, the batch synthesis client, and the transcribe-and-rescore QC pass. |
+| [UltiMed-ASR-FR-v1-Voxtral](https://github.com/thiswillbeyourgithub/UltiMed-ASR-FR-v1-Voxtral) | The Voxtral TTS container that spoke every clip of the dataset: Dockerfile, tuning, and the vllm-omni patches. |
+| **This repository** | The NeMo fork and training configs used for the fine-tune, documented here. |
+
+Upstream base model: [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), on top of [NVIDIA-NeMo/NeMo](https://github.com/NVIDIA-NeMo/NeMo).
 
 **The detailed engineering notes are in the tree itself**, not in a separate document, so they
 cannot drift away from what they describe. `perso/training_config.yaml` is annotated at length:
