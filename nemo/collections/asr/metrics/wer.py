@@ -289,6 +289,19 @@ class WER(Metric):
         self.add_state("scores", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
         self.add_state("words", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
 
+        # --- normalised WER, logged alongside the raw one ---
+        # Off by default: nothing else in NeMo pays for it. Set track_normalised
+        # to have update() also score punctuation- and case-insensitive text.
+        #
+        # These are deliberately plain attributes rather than add_state, because
+        # both RNNT validation paths (fused and unfused) call update/compute/reset
+        # per batch, and reset() would wipe a proper metric state before anything
+        # could read it. The consumer drains and zeroes these itself. Callers must
+        # therefore reset them explicitly at the start of each dataloader.
+        self.track_normalised = False
+        self.normalised_scores = 0
+        self.normalised_words = 0
+
     def update(
         self,
         predictions: torch.Tensor,
@@ -352,6 +365,16 @@ class WER(Metric):
 
         self.scores = torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
         self.words = torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
+
+        if self.track_normalised:
+            # Reuses the hypotheses and references already decoded above; decoding
+            # is the expensive part of validation and must not happen twice.
+            from nemo.collections.asr.metrics.wer_normalised import normalised_edit_counts
+
+            hyp_texts = [(h[0] if isinstance(h, list) else h).text for h in hypotheses]
+            norm_scores, norm_words = normalised_edit_counts(hyp_texts, references, use_cer=self.use_cer)
+            self.normalised_scores += norm_scores
+            self.normalised_words += norm_words
 
     def compute(self):
         scores = self.scores.detach().float()
