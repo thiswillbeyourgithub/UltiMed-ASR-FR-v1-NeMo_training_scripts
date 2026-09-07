@@ -205,3 +205,12 @@ perso/ultimed_data_ignore-backups
 # My own voice recordings (the `oli` eval source: 205 clips of me reading drug
 # names aloud, plus its manifests). Real human speech, never redistributed.
 perso/oli_spoken_dataset/
+
+# Local eval/benchmark byproducts and audio. calibration_audio_medical/ holds
+# PARHAF-derived clips, exports/ultimed/ holds built model artifacts; neither is
+# redistributed from here.
+perso/calibration_audio_medical/
+perso/exports/ultimed/
+perso/benchmark_results.jsonl
+perso/benchmark_results.md
+perso/eval_results.jsonl
