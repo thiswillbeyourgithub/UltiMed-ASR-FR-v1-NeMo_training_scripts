@@ -5,7 +5,10 @@ numba-cuda==0.15.1 ; platform_system != 'Darwin'
 cuda-bindings ; platform_system != 'Darwin'
 numexpr<2.14.0 # WAR for attempted use of nonexistent numpy.typing
 numpy>=1.22
-onnx>=1.7.0
+# <1.19: onnx 1.19 imports ml_dtypes.float4_e2m1fn at module load, which needs
+# ml_dtypes>=0.5, but the numpy<2 pin holds ml_dtypes at 0.4.1 -> broken import.
+# onnx 1.18 tolerates ml_dtypes 0.4.1 (README also pins 1.18.0).
+onnx>=1.7.0,<1.19
 # Align with upstream PyTorch requirements
 protobuf~=5.29.5
 python-dateutil

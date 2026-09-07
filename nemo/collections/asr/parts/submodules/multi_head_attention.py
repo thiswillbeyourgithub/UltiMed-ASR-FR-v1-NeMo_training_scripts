@@ -1074,6 +1074,31 @@ class RelPositionalEncoding(PositionalEncoding):
         positions = torch.arange(length - 1, -length, -1, dtype=torch.float32, device=device).unsqueeze(1)
         self.create_pe(positions=positions, dtype=dtype)
 
+    def _runtime_pe(self, x, cache_len=0):
+        """Compute the relative positional encoding in-graph instead of
+        slicing the precomputed ``self.pe`` buffer.
+
+        Opt-in for ONNX export (``export_runtime_pe = True``, set by an
+        export script): the exported graph then carries Range/Sin/Cos ops
+        sized to the actual input instead of a baked
+        ``(1, 2*max_len-1, d_model)`` fp32 table, which removes both the
+        table's file size and the max_len cap on input length. The values
+        match ``create_pe``'s exactly: same descending positions
+        ``(L-1) .. -(L-1)`` and same div_term math, with sin/cos interleaved
+        into the even/odd feature columns.
+        """
+        input_len = x.size(1) + cache_len
+        positions = torch.arange(
+            input_len - 1, -input_len, -1, dtype=torch.float32, device=x.device
+        ).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=x.device)
+            * -(math.log(INF_VAL) / self.d_model)
+        )
+        prod = positions * div_term
+        pe = torch.stack((torch.sin(prod), torch.cos(prod)), dim=-1).flatten(1)
+        return pe.unsqueeze(0).to(x.dtype)
+
     def forward(self, x, cache_len=0):
         """Compute positional encoding.
         Args:
@@ -1087,14 +1112,17 @@ class RelPositionalEncoding(PositionalEncoding):
         if self.xscale:
             x = x * self.xscale
 
-        # center_pos would be the index of position 0
-        # negative positions would be used for right and positive for left tokens
-        # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
-        input_len = x.size(1) + cache_len
-        center_pos = self.pe.size(1) // 2 + 1
-        start_pos = center_pos - input_len
-        end_pos = center_pos + input_len - 1
-        pos_emb = self.pe[:, start_pos:end_pos]
+        if getattr(self, "export_runtime_pe", False):
+            pos_emb = self._runtime_pe(x, cache_len)
+        else:
+            # center_pos would be the index of position 0
+            # negative positions would be used for right and positive for left tokens
+            # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
+            input_len = x.size(1) + cache_len
+            center_pos = self.pe.size(1) // 2 + 1
+            start_pos = center_pos - input_len
+            end_pos = center_pos + input_len - 1
+            pos_emb = self.pe[:, start_pos:end_pos]
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb

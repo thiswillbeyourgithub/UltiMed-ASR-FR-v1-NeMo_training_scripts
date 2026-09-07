@@ -273,6 +273,11 @@ class Exportable(ABC):
                             opset_version=onnx_opset_version,
                             keep_initializers_as_inputs=keep_initializers_as_inputs,
                             export_modules_as_functions=export_modules_as_functions,
+                            # torch >= 2.9 defaults to the dynamo exporter, which
+                            # rejects this dynamic_axes dict outright; this legacy
+                            # TorchScript path is the one NeMo's export contract
+                            # (and the downstream ONNX tooling) was built on.
+                            dynamo=False,
                         )
 
                     if check_trace:
