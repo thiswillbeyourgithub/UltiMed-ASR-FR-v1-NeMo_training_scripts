@@ -24,6 +24,9 @@ SETS = {
     "med_drugs": "./perso/ultimed_data_ignore-backups/NeMO_files/drugs/val.down-300.jsonl",
     "med_acronyms": "./perso/ultimed_data_ignore-backups/NeMO_files/acronyms/val.down-150.jsonl",
     "med_drug_sentence": "./perso/drug_sentence_dataset/val.json",
+    # PARROT is eval-only: unlike the five val.down-* sets above it was never
+    # used to monitor training, so it is the one genuinely held-out medical set.
+    "med_parrot": "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.down-200.jsonl",
 }
 
 
