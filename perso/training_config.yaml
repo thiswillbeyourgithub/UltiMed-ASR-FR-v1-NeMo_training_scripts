@@ -538,7 +538,7 @@ model:
       # was actually validated and checkpoint-selected on. To run the config
       # as-is, either drop these two blocks and the corresponding entry in
       # exp_manager.checkpoint_callback_params, or substitute your own
-      # real-speech manifest. See README.md and perso/README.md.
+      # real-speech manifest. See README.md.
       - name: oli_drug_sentence
         manifest_filepath: "./perso/oli_spoken_dataset/nemo_manifest_ordered_uncapitaliazedDCI.json"
         sample_rate: 16000
@@ -734,7 +734,7 @@ model:
       # was actually validated and checkpoint-selected on. To run the config
       # as-is, either drop these two blocks and the corresponding entry in
       # exp_manager.checkpoint_callback_params, or substitute your own
-      # real-speech manifest. See README.md and perso/README.md.
+      # real-speech manifest. See README.md.
       - name: oli_drug_sentence
         manifest_filepath: "./perso/oli_spoken_dataset/nemo_manifest_ordered_uncapitaliazedDCI.json"
         sample_rate: 16000

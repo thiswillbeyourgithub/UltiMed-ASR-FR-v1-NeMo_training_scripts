@@ -91,7 +91,7 @@ fi
 #   cached-but-unused blocks instead of sitting on them. nvidia-smi reports
 #   ~23.6 of 24.5 GB on the worst-case batch, but that is mostly the allocator
 #   holding freed blocks: stealing VRAM from a second process puts the true
-#   peak at ~21.3 GiB, so real headroom is ~2.2 GB (see perso/README.md).
+#   peak at ~21.3 GiB, so real headroom is ~2.2 GB (see README.md).
 # - NUMBA_CUDA_USE_NVIDIA_BINDING: required by the numba TDT loss kernels.
 # - PYTHONUNBUFFERED: so the log file gets lines as they happen.
 export NUMBA_CUDA_USE_NVIDIA_BINDING=1

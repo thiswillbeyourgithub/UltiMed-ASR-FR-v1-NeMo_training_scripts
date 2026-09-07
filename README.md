@@ -24,10 +24,11 @@ record what actually ran.
 | The un-finetuned baseline, same ONNX optimisations | [huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx) |
 | Upstream base model | [huggingface.co/nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
 
-**The detailed engineering notes are in [`perso/README.md`](perso/README.md)**: VRAM measurements,
-the OOM frontier, why the optimizer was silently doing nothing, what the config audit found, and
-the version-by-version record of each training run. That file is the interesting one. This one is
-the map.
+**The detailed engineering notes are in the tree itself**, not in a separate document, so they
+cannot drift away from what they describe. `perso/training_config.yaml` is annotated at length:
+the VRAM cost model and the ten measured OOM points it was fitted on, why each setting is the
+value it is, and what to change first when it has to move. The commit messages below explain
+each patch. The launcher scripts document themselves in their headers.
 
 ## What each patch does
 
@@ -97,7 +98,28 @@ you re-lock: 1.19 hard-imports `ml_dtypes.float4_e2m1fn`, which the `numpy<2` pi
 unsatisfiable, and NeMo then fails to import at all.
 
 Trained on a single RTX 3090 Ti (24 GB). The VRAM budget in the config is fitted to that card;
-see `perso/README.md` before changing `max_duration` or `cost_batching.budget`, which are coupled.
+read the comments around `cost_batching` in `perso/training_config.yaml` before changing
+`max_duration` or `cost_batching.budget`, which are coupled, and re-run
+`NEMO_EXP_DIR=/tmp/oom_check ./perso/oom_margin_check.sh` afterwards.
+
+Validation was checked separately rather than argued about, because `compute_eval_loss` defaults
+to true and validation therefore builds the same joint lattice training does. Nine of the fifteen
+validation sets score above the 15000 training budget on the cost model (worst: `fleurs_it` at
+37344), and `num_sanity_val_steps` cannot catch a problem there because validation sets have
+`shuffle: false`, so the sanity pass sees the *first* batches rather than the longest ones. A
+validation OOM would land about 3.5 h in, before the first checkpoint exists. Measured instead
+(2026-08-22, with Claude Code) on a fixture holding the two longest batches of every one of the
+15 validation sets, run after one training batch so the optimizer state is resident: exit 0,
+peak 21363 of 24564 MiB, no OOM, all 15 dataloaders completed. Validation is the cheaper phase
+despite the longer clips. Re-run that check if the validation batch sizes or manifests change.
+
+## Reading the tree
+
+Four entries in `perso/` look like duplicates of files that also live in the normal NeMo layout:
+`cached_encoder_dataset.py`, `latent_augment.py`, `speech_to_text_finetune.py` and
+`speech_to_text_finetune_cached.py` (the last being the training entry point). They are symlinks
+into the live tree, not copies, so there is only ever one real file to edit. They started out as
+genuine byte-identical copies and were converted once that was noticed.
 
 ## What is deliberately not in this repo
 

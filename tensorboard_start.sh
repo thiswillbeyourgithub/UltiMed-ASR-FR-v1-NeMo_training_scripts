@@ -107,6 +107,6 @@ fi
 
 # setuptools is pinned because tensorboard 2.20 still imports pkg_resources,
 # which newer setuptools no longer provides; 81.0.0 is the version recorded as
-# known-working in perso/README.md.
+# known-working here.
 exec uvx --python 3.10.12 --with setuptools==81.0.0 --from tensorboard==2.20.0 \
   tensorboard --logdir "$NEMO_EXP_DIR" --bind_all --port "$PORT" "${passthrough[@]}"
