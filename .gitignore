@@ -201,3 +201,7 @@ perso/grid_stitch_datasets/
 # dataset drive (its target embeds the username, so it must never be tracked).
 perso/training_logs_ignore-backups/
 perso/ultimed_data_ignore-backups
+
+# My own voice recordings (the `oli` eval source: 205 clips of me reading drug
+# names aloud, plus its manifests). Real human speech, never redistributed.
+perso/oli_spoken_dataset/
