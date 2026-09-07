@@ -1,5 +1,16 @@
 # UltiMed-ASR-FR-v1: NeMo training scripts
 
+> [!WARNING]
+> **This documentation was written by an AI agent (Claude Code) and very likely contains some
+> degree of hallucination.** Treat it as a guided tour, not as a specification: the code, the
+> configs and the commit history are the source of truth, and where they disagree with a
+> sentence below, they win.
+>
+> It is written this way on purpose. I published this to be useful to other people, and I cannot
+> afford the time to document all of it properly by hand. The expected way to onboard is to point
+> an LLM at the repository and have it check every claim against the actual files, which is also
+> how it was written. If you find something wrong, an issue is welcome.
+
 **This repository is a fork of [NVIDIA-NeMo/NeMo](https://github.com/NVIDIA-NeMo/NeMo).**
 It is not a general-purpose NeMo distribution and it is not maintained as one. It exists to
 document, reproducibly, how [Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx](https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-UltiMed-onnx)
