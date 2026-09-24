@@ -29,6 +29,16 @@ SETS = {
     "med_parrot": "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.down-200.jsonl",
 }
 
+# Release test split (never trained on, never used for checkpoint selection),
+# 10,000 clips sampled by build_ultimed_val_slices.py, plus all of PARROT test.
+TEST_SETS = {
+    "test_dictionary": "./perso/ultimed_data_ignore-backups/NeMO_files/test.dictionary.down-5290.jsonl",
+    "test_parhaf": "./perso/ultimed_data_ignore-backups/NeMO_files/test.parhaf.down-2500.jsonl",
+    "test_drugs": "./perso/ultimed_data_ignore-backups/NeMO_files/test.drugs.down-2059.jsonl",
+    "test_acronyms": "./perso/ultimed_data_ignore-backups/NeMO_files/test.acronyms.down-151.jsonl",
+    "test_parrot": "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.jsonl",
+}
+
 
 def resolve(manifest: Path, audio_filepath: str) -> Path:
     # UltiMed paths are relative to the manifest dir; drug_sentence paths are
@@ -72,7 +82,7 @@ def main():
     ap.add_argument("--out", default="./perso/ultimed_data_ignore-backups/wer_fixtures")
     args = ap.parse_args()
     out_root = Path(args.out)
-    for label, mf in SETS.items():
+    for label, mf in {**SETS, **TEST_SETS}.items():
         build(label, Path(mf), out_root)
     print("DONE")
 

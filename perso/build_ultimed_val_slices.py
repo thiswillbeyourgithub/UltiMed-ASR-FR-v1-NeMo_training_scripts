@@ -8,9 +8,16 @@ per source so validation stays cheap while still tracking every source.
 Slices are written NEXT TO their source manifest (val.down-<N>.jsonl) because
 audio paths inside are relative to the manifest's directory.
 
-Clips longer than --max-duration are excluded: validation computes the RNNT
-loss lattice, whose memory scales with (batch padded length), so one 60 s
-clip in a batch would spike VRAM. Training applies the same 45 s cap anyway.
+Clips longer than --max-duration are excluded from the validation slices:
+validation computes the RNNT loss lattice, whose memory scales with (batch
+padded length), so one 60 s clip in a batch would spike VRAM. Training applies
+the same 45 s cap anyway.
+
+TEST_SLICES sample the release test split (top-level test.jsonl, the split the
+model never trained on) per category for the final ONNX benchmark. They keep
+every duration, since that benchmark decodes one clip at a time and must
+represent the split as released: 10,000 clips in total, every acronym and drug
+clip plus fixed PARHAF and dictionary samples.
 
 Made with Claude Code.
 
@@ -35,7 +42,33 @@ SLICES = [
     ("PARROT", "test.jsonl", "test.down-200.jsonl", 200),
 ]
 
+# (category, output name, sample size); source is <nemo-files-dir>/test.jsonl
+TEST_SLICES = [
+    ("dictionary", "test.dictionary.down-5290.jsonl", 5290),
+    ("parhaf", "test.parhaf.down-2500.jsonl", 2500),
+    ("drugs", "test.drugs.down-2059.jsonl", 2059),
+    ("acronyms", "test.acronyms.down-151.jsonl", 151),
+]
+
 SEED = 42
+
+
+def write_slice(rows: list[str], n: int, out: Path) -> None:
+    rng = random.Random(SEED)
+    picked = rows if len(rows) <= n else rng.sample(rows, n)
+    out.write_text("\n".join(picked) + "\n")
+    hours = sum(json.loads(r)["duration"] for r in picked) / 3600
+    print(f"{out}: {len(picked)} clips ({hours:.2f} h) from {len(rows)} eligible")
+
+
+def read_rows(src: Path, keep) -> list[str]:
+    rows = []
+    with src.open() as f:
+        for line in f:
+            line = line.strip()
+            if line and keep(json.loads(line)):
+                rows.append(line)
+    return rows
 
 
 def main() -> None:
@@ -51,22 +84,14 @@ def main() -> None:
 
     base = Path(args.nemo_files_dir)
     for subdir, src_name, out_name, n in SLICES:
-        src = base / subdir / src_name
-        rows = []
-        with src.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                if args.min_duration <= row["duration"] <= args.max_duration:
-                    rows.append(line)
-        rng = random.Random(SEED)
-        picked = rows if len(rows) <= n else rng.sample(rows, n)
-        out = base / subdir / out_name
-        out.write_text("\n".join(picked) + "\n")
-        hours = sum(json.loads(r)["duration"] for r in picked) / 3600
-        print(f"{out}: {len(picked)} clips ({hours:.2f} h) from {len(rows)} eligible")
+        rows = read_rows(
+            base / subdir / src_name,
+            lambda r: args.min_duration <= r["duration"] <= args.max_duration,
+        )
+        write_slice(rows, n, base / subdir / out_name)
+    for category, out_name, n in TEST_SLICES:
+        rows = read_rows(base / "test.jsonl", lambda r: r["category"] == category)
+        write_slice(rows, n, base / out_name)
 
 
 if __name__ == "__main__":
