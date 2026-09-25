@@ -122,6 +122,13 @@ def normalize_text(text: str) -> str:
     str
         NFKC-folded, lowercased, punctuation removed, whitespace collapsed.
         ``"  Le Patient, 3 mg. "`` -> ``"le patient 3 mg"``.
+
+    Notes
+    -----
+    UltiMed-ASR-FR-v1-scripts' ``99_hf_release/04_drop_bad_rows.py`` keeps a
+    deliberate copy of this function (separate repo) to drop eval rows whose text
+    repeats a training text before release. Keep the two identical, or the release
+    script calls clean a dataset this check refuses.
     """
     text = unicodedata.normalize("NFKC", text).lower()
     text = _PUNCT_RE.sub(" ", text)
