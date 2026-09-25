@@ -19,12 +19,12 @@ from pathlib import Path
 # label -> eval manifest (the same downsampled val sets the training monitor
 # used for the in-domain part of combined_macro_val_wer, plus acronyms)
 SETS = {
-    "med_dictionary": "./perso/ultimed_data_ignore-backups/NeMO_files/dictionary/val.down-600.jsonl",
-    "med_parhaf": "./perso/ultimed_data_ignore-backups/NeMO_files/PARHAF/val.down-300.jsonl",
-    "med_drugs": "./perso/ultimed_data_ignore-backups/NeMO_files/drugs/val.down-300.jsonl",
-    "med_acronyms": "./perso/ultimed_data_ignore-backups/NeMO_files/acronyms/val.down-150.jsonl",
+    "med_dictionary": "./perso/ultimed_data_ignore-backups/NeMO_files/val.dictionary.down-600.jsonl",
+    "med_parhaf": "./perso/ultimed_data_ignore-backups/NeMO_files/val.parhaf.down-300.jsonl",
+    "med_drugs": "./perso/ultimed_data_ignore-backups/NeMO_files/val.drugs.down-300.jsonl",
+    "med_acronyms": "./perso/ultimed_data_ignore-backups/NeMO_files/val.acronyms.down-150.jsonl",
     "med_drug_sentence": "./perso/drug_sentence_dataset/val.json",
-    # PARROT is eval-only: unlike the five val.down-* sets above it was never
+    # PARROT is eval-only: unlike the val.*.down-* sets above it was never
     # used to monitor training, so it is the one genuinely held-out medical set.
     "med_parrot": "./perso/ultimed_data_ignore-backups/NeMO_files/PARROT/test.down-200.jsonl",
 }

@@ -550,8 +550,10 @@ model:
         prefetch_factor: 2
 
       # ---- UltiMed-ASR-FR seeded validation slices ----------------------
+      # Sampled from the RELEASE-WIDE val.jsonl by perso/build_ultimed_val_slices.py.
+      # Never point these at <source>/val.jsonl: that per-source split overlaps train.jsonl.
       - name: ultimed_dictionary
-        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/dictionary/val.down-600.jsonl"
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/val.dictionary.down-600.jsonl"
         sample_rate: 16000
         batch_size: 4  # clips reach the 45 s cap; keep the loss lattice bounded
         shuffle: false
@@ -561,7 +563,7 @@ model:
         prefetch_factor: 2
 
       - name: ultimed_parhaf
-        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/PARHAF/val.down-300.jsonl"
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/val.parhaf.down-300.jsonl"
         sample_rate: 16000
         batch_size: 2  # long-form hospital reports, many near 45 s
         shuffle: false
@@ -571,7 +573,7 @@ model:
         prefetch_factor: 2
 
       - name: ultimed_drugs
-        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/drugs/val.down-300.jsonl"
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/val.drugs.down-300.jsonl"
         sample_rate: 16000
         batch_size: 6
         shuffle: false
@@ -581,7 +583,7 @@ model:
         prefetch_factor: 2
 
       - name: ultimed_acronyms
-        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/acronyms/val.down-150.jsonl"
+        manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/val.acronyms.down-150.jsonl"
         sample_rate: 16000
         batch_size: 6
         shuffle: false
