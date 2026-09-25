@@ -64,15 +64,34 @@ def parse_args():
     return p.parse_args()
 
 
+def load_base_model(cfg):
+    """Return the model the fine-tune starts from, and its name.
+
+    The training config names it with either ``init_from_nemo_model`` (a local
+    .nemo, e.g. parakeet-ultra) or ``init_from_pretrained_model`` (a Hub name,
+    e.g. nvidia/parakeet-tdt-0.6b-v3); the training script accepts exactly one,
+    so the same rule applies here. Relative .nemo paths resolve against the
+    working directory, like in training, which is the repo root.
+    """
+    nemo_path = cfg.get("init_from_nemo_model", None)
+    pretrained = cfg.get("init_from_pretrained_model", None)
+    if nemo_path and pretrained:
+        raise SystemExit("The config sets both init_from_nemo_model and init_from_pretrained_model.")
+    if nemo_path:
+        if not Path(nemo_path).exists():
+            raise SystemExit(f"init_from_nemo_model does not exist: {nemo_path}")
+        return ASRModel.restore_from(restore_path=str(nemo_path)), Path(nemo_path).name
+    if pretrained:
+        return ASRModel.from_pretrained(model_name=pretrained), pretrained
+    raise SystemExit("The config has neither init_from_nemo_model nor init_from_pretrained_model.")
+
+
 def load_model(cfg, checkpoint):
     """Return the model to score, and a label describing what it is."""
-    pretrained = cfg.get("init_from_pretrained_model", None)
-
     if checkpoint is None:
-        if not pretrained:
-            raise SystemExit("No --checkpoint given and the config has no init_from_pretrained_model.")
-        logging.info(f"Scoring the pretrained baseline: {pretrained}")
-        return ASRModel.from_pretrained(model_name=pretrained), f"pretrained:{pretrained}"
+        model, name = load_base_model(cfg)
+        logging.info(f"Scoring the pretrained baseline: {name}")
+        return model, f"pretrained:{name}"
 
     path = Path(checkpoint)
     if not path.exists():
@@ -83,9 +102,12 @@ def load_model(cfg, checkpoint):
         return ASRModel.restore_from(restore_path=str(path)), path.name
 
     # A Lightning .ckpt holds weights but not the architecture, so build the
-    # model from the same pretrained name the run started from and load into it.
-    logging.info(f"Building {pretrained} and loading weights from {path}")
-    model = ASRModel.from_pretrained(model_name=pretrained)
+    # model from the same base model the run started from and load into it.
+    # NOTE: this uses the CURRENT config's base model; a .ckpt from a run that
+    # started elsewhere still loads (same architecture), which is fine because
+    # every weight is then overwritten by the strict key check below.
+    model, name = load_base_model(cfg)
+    logging.info(f"Built {name}, loading weights from {path}")
     ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
     state = ckpt.get("state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)

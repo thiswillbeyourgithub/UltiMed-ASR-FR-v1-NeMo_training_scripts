@@ -104,11 +104,27 @@ encoder_cache:
 # but it would have quietly built a 6x smaller cache. Found by the config
 # audit (see nemo/collections/asr/parts/utils/config_audit.py).
 
-# Pretrained model initialization
-# Use init_from_pretrained_model for automatic download from NGC
-init_from_pretrained_model: "nvidia/parakeet-tdt-0.6b-v3"
-# Alternative: Use init_from_nemo_model if you have a local .nemo file
-# init_from_nemo_model: "/path/to/parakeet-tdt-0.6b-v3.nemo"
+# Pretrained model initialization. Set exactly one of the two keys (the training
+# script refuses both).
+#
+# After 1.5.0 the fine-tune starts from moondream's parakeet-ultra
+# (https://huggingface.co/moondream/parakeet-ultra, CC BY 4.0): a full-precision
+# post-train of parakeet-tdt-0.6b-v3 with the SAME architecture and tokenizer, so
+# every setting below (freeze depth, AdamSPD, decoding, cache layout) applies
+# unchanged. moondream ships it as a HF transformers checkpoint; the NeMo form
+# used here was rebuilt onto the base v3 .nemo by parakeet_web's
+# scripts/hf-to-nemo.py (a key rename, every learned weight is moondream's) and
+# sits in the sibling repo parakeet-tdt-0.6b-v3-ultra-onnx. The path is relative
+# to the repo root (the directory training is launched from, like every other
+# "./perso/..." path here), so nothing user-specific is committed.
+# Changing this value changes the encoder cache fingerprint
+# (precompute_encoder_cache.py), so a cache built from another base model is
+# detected as stale and rebuilt instead of silently reused.
+# evaluate_checkpoint.py reads the same key for its baseline row and to rebuild
+# the architecture a .ckpt is loaded into.
+init_from_nemo_model: "../parakeet-tdt-0.6b-v3-ultra-onnx/parakeet-tdt-0.6b-v3-ultra.nemo"
+# Runs up to 1.5.0 started from NVIDIA's stock checkpoint (automatic download):
+# init_from_pretrained_model: "nvidia/parakeet-tdt-0.6b-v3"
 
 model:
   # Seed for deterministic training: data shuffling, dropout, augmentation.
