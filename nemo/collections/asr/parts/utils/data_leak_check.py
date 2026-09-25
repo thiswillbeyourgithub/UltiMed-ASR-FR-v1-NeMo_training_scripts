@@ -62,6 +62,20 @@ Size alone is not a usable filter on its own: with ~70k eval clips most
 training FLAC sizes match one of them, which is what made the first version
 of this check hash nearly the whole training set.
 
+Hash cache
+----------
+Even narrowed, a cold first run takes ~10 min on the UltiMed corpus, mostly
+disk reads. So every quick fingerprint and full hash is persisted in a small
+sqlite file (``data_leak_check.cache_path``), keyed by absolute path and
+stored with the file's ``st_size`` and ``st_mtime_ns``. On the next launch a
+file is only ``os.stat``-ed: if size and mtime both still match, its cached
+digests are reused, otherwise they are recomputed and overwritten. This is
+the same staleness rule ``make`` and ``rsync`` use; it misses only a
+same-size rewrite that also restores the old mtime, which nothing in this
+pipeline does. ``data_leak_check.recompute_cache: true`` ignores every cached
+digest for one run (fresh values are still written back). A missing,
+unreadable or corrupt cache file only costs a full recompute, never a failure.
+
 Rows whose audio file does not exist (a manifest not mounted on this machine,
 or a tarred set whose ``audio_filepath`` is a member name) still get the text
 check; their audio is counted as unchecked and reported, not silently passed.
@@ -73,6 +87,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -134,6 +149,7 @@ class _Row:
     segment: Tuple[Optional[float], Optional[float]]  # (offset, duration) if sliced
     text_hash: Optional[str]
     size: Optional[int] = None
+    mtime_ns: Optional[int] = None
 
 
 @dataclass
@@ -229,7 +245,75 @@ def _quick_fingerprint(path: str, size: int) -> str:
     return h.hexdigest()
 
 
-def _audio_keys(splits: Dict[str, "_Split"]) -> Dict[str, Dict[tuple, _Row]]:
+class _HashCache:
+    """Persistent ``path -> (size, mtime_ns, quick, full)`` store, see "Hash cache" above.
+
+    The whole table is loaded into a dict up front and new or changed entries
+    are written back in one transaction by :meth:`save`, since per-lookup
+    sqlite round trips over ~600k files would cost more than they save.
+    ``path=None`` gives a purely in-memory cache (used by the tests and when
+    no cache path is configured).
+    """
+
+    def __init__(self, path: Optional[str], recompute: bool = False):
+        self.path = path
+        self.entries: Dict[str, list] = {}  # path -> [size, mtime_ns, quick, full]
+        self.dirty: Set[str] = set()
+        self.hits = self.misses = 0
+        if path is None or recompute or not os.path.isfile(path):
+            return
+        try:
+            with sqlite3.connect(path) as db:
+                for p, size, mtime, quick, full in db.execute("SELECT path, size, mtime_ns, quick, full FROM files"):
+                    self.entries[p] = [size, mtime, quick, full]
+        except sqlite3.Error as e:
+            logging.warning(f"data_leak_check: cache {path} unreadable ({e}), recomputing everything.")
+            self.entries = {}
+
+    def _entry(self, row: _Row) -> list:
+        """The row's entry, reset if the file changed since it was cached."""
+        entry = self.entries.get(row.audio_path)
+        if entry is None or entry[0] != row.size or entry[1] != row.mtime_ns:
+            entry = self.entries[row.audio_path] = [row.size, row.mtime_ns, None, None]
+        return entry
+
+    def quick(self, row: _Row) -> str:
+        entry = self._entry(row)
+        if entry[2] is None:
+            self.misses += 1
+            entry[2] = _quick_fingerprint(row.audio_path, row.size)
+            self.dirty.add(row.audio_path)
+        else:
+            self.hits += 1
+        return entry[2]
+
+    def full(self, row: _Row) -> str:
+        entry = self._entry(row)
+        if entry[3] is None:
+            entry[3] = _sha256_file(row.audio_path)
+            self.dirty.add(row.audio_path)
+        return entry[3]
+
+    def save(self) -> None:
+        if self.path is None or not self.dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with sqlite3.connect(self.path) as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS files "
+                    "(path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, quick TEXT, full TEXT)"
+                )
+                db.executemany(
+                    "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)",
+                    [(p, *self.entries[p]) for p in self.dirty],
+                )
+        except (sqlite3.Error, OSError) as e:
+            # Not fatal: the check itself already ran, only the next launch is slower.
+            logging.warning(f"data_leak_check: could not write cache {self.path} ({e}).")
+
+
+def _audio_keys(splits: Dict[str, "_Split"], cache: _HashCache) -> Dict[str, Dict[tuple, _Row]]:
     """Map each role to ``{audio fingerprint: representative row}``.
 
     Implements the three-stage narrowing described in the module docstring.
@@ -241,12 +325,13 @@ def _audio_keys(splits: Dict[str, "_Split"]) -> Dict[str, Dict[tuple, _Row]]:
     for split in splits.values():
         for row in split.rows:
             if row.audio_path is not None:
-                row.size = os.stat(row.audio_path).st_size
+                st = os.stat(row.audio_path)
+                row.size, row.mtime_ns = st.st_size, st.st_mtime_ns
     eval_sizes = {r.size for name in ("val", "test") for r in splits[name].rows if r.size is not None}
 
     # Stage 1 + 2: quick fingerprint of every eval file and of the training
-    # files that survive the size filter. Cached per path, since one file can
-    # be listed in several manifests.
+    # files that survive the size filter. Keyed per path, since one file can
+    # be listed in several manifests; the digests themselves come from `cache`.
     quick: Dict[str, str] = {}
     candidates: Dict[str, List[_Row]] = {}
     for name, split in splits.items():
@@ -255,7 +340,7 @@ def _audio_keys(splits: Dict[str, "_Split"]) -> Dict[str, Dict[tuple, _Row]]:
             if row.audio_path is None or (name == "train" and row.size not in eval_sizes):
                 continue
             if row.audio_path not in quick:
-                quick[row.audio_path] = _quick_fingerprint(row.audio_path, row.size)
+                quick[row.audio_path] = cache.quick(row)
             rows.append(row)
         candidates[name] = rows
 
@@ -264,22 +349,22 @@ def _audio_keys(splits: Dict[str, "_Split"]) -> Dict[str, Dict[tuple, _Row]]:
     for name, rows in candidates.items():
         for row in rows:
             roles_per_fp.setdefault(quick[row.audio_path], set()).add(name)
-    full: Dict[str, str] = {}
+    full: Set[str] = set()
     keys: Dict[str, Dict[tuple, _Row]] = {}
     for name, rows in candidates.items():
         table: Dict[tuple, _Row] = {}
         for row in rows:
             fp = quick[row.audio_path]
             if len(roles_per_fp[fp]) > 1:
-                if row.audio_path not in full:
-                    full[row.audio_path] = _sha256_file(row.audio_path)
-                key = ("full", full[row.audio_path], row.segment)
+                full.add(row.audio_path)
+                key = ("full", cache.full(row), row.segment)
             else:
                 key = ("quick", fp, row.segment)
             table.setdefault(key, row)
         keys[name] = table
     logging.info(
-        f"data_leak_check: {len(quick)} audio files quick-fingerprinted, {len(full)} fully hashed."
+        f"data_leak_check: {len(quick)} audio files quick-fingerprinted ({cache.hits} from cache, "
+        f"{cache.misses} read), {len(full)} compared by full hash."
     )
     return keys
 
@@ -292,13 +377,24 @@ def _describe(label: str, overlap: Set, a: Dict, b: Dict) -> str:
     return f"  {label}: {len(overlap)} shared\n" + "\n".join(examples)
 
 
-def check_data_leaks(train_manifests: List[str], val_manifests: List[str], test_manifests: List[str]) -> dict:
+def check_data_leaks(
+    train_manifests: List[str],
+    val_manifests: List[str],
+    test_manifests: List[str],
+    cache_path: Optional[str] = None,
+    recompute_cache: bool = False,
+) -> dict:
     """Raise :class:`DataLeakError` if any eval sample is also a training sample.
 
     Parameters
     ----------
     train_manifests, val_manifests, test_manifests : list of str
         Manifest paths per role, e.g. from :func:`collect_manifests`.
+    cache_path : str, optional
+        sqlite file persisting audio digests across runs (see "Hash cache" in
+        the module docstring). ``None`` keeps them in memory for this call only.
+    recompute_cache : bool
+        Ignore every cached digest and recompute, still writing the fresh ones.
 
     Returns
     -------
@@ -326,7 +422,11 @@ def check_data_leaks(train_manifests: List[str], val_manifests: List[str], test_
     texts = {
         name: {r.text_hash: r for r in split.rows if r.text_hash is not None} for name, split in splits.items()
     }
-    audio = _audio_keys(splits)
+    cache = _HashCache(cache_path, recompute=recompute_cache)
+    audio = _audio_keys(splits, cache)
+    # Saved before judging, so a run that raises still leaves a warm cache for
+    # the relaunch after the manifests are fixed.
+    cache.save()
 
     counts: dict = {}
     fatal: List[str] = []

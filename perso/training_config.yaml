@@ -1533,6 +1533,15 @@ exp_manager:
 # that knowingly evaluates on seen data.
 data_leak_check:
   enabled: true
+  # sqlite store of per-file audio digests, keyed by path + size + mtime, so
+  # only new or changed files are read on later launches (cold run ~10 min,
+  # warm run is just an os.stat per file). Lives next to the experiments so
+  # it survives across runs and stays out of git. null = no persistence.
+  cache_path: ${oc.env:NEMO_EXP_DIR,./nemo_experiments}/data_leak_check_cache.sqlite
+  # true = ignore every cached digest and recompute them all this launch
+  # (fresh values are still written back). For when the cache is suspected
+  # stale, e.g. files rewritten in place with their mtime preserved.
+  recompute_cache: false
 
 config_audit:
   enabled: true

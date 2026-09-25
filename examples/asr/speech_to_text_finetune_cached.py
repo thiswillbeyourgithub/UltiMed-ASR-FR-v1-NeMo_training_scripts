@@ -909,6 +909,8 @@ def _build(cfg):
             train_manifests=collect_manifests(cfg.model.get("train_ds", None)),
             val_manifests=collect_manifests(cfg.model.get("validation_ds", None)),
             test_manifests=collect_manifests(cfg.model.get("test_ds", None)),
+            cache_path=leak_cfg.get("cache_path", None),
+            recompute_cache=leak_cfg.get("recompute_cache", False),
         )
     else:
         logging.warning("data_leak_check.enabled is false, train/val/test overlap is NOT checked.")

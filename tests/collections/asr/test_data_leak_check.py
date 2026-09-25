@@ -124,3 +124,47 @@ def test_quick_fingerprint_collision_is_settled_by_full_hash(corpus):
     train = _write_manifest(corpus / "train.json", [{"audio_filepath": "audio/x.flac", "text": "un"}])
     val = _write_manifest(corpus / "val.json", [{"audio_filepath": "audio/y.flac", "text": "deux"}])
     assert check_data_leaks([train], [val], [])["train_val_audio"] == 0
+
+
+def test_cache_reuses_digests_and_notices_changes(corpus, monkeypatch):
+    """Second run reads nothing; a rewritten file (new size/mtime) is re-read; recompute ignores the cache."""
+    import os
+
+    from nemo.collections.asr.parts.utils import data_leak_check as dlc
+
+    cache = str(corpus / "cache.sqlite")
+    train = _write_manifest(corpus / "train.json", [{"audio_filepath": "audio/a.flac", "text": "un"}])
+    val = _write_manifest(corpus / "val.json", [{"audio_filepath": "audio/c.flac", "text": "deux"}])
+
+    reads = []
+    real = dlc._quick_fingerprint
+    monkeypatch.setattr(dlc, "_quick_fingerprint", lambda path, size: reads.append(path) or real(path, size))
+
+    assert check_data_leaks([train], [val], [], cache_path=cache)["train_val_audio"] == 0
+    assert len(reads) == 2
+    reads.clear()
+    check_data_leaks([train], [val], [], cache_path=cache)
+    assert reads == [], "unchanged files must come from the cache"
+
+    # Rewrite c.flac so it becomes a copy of a.flac: same size, new mtime. A
+    # stale cache would keep the old digest and miss the leak.
+    c = corpus / "audio" / "c.flac"
+    c.write_bytes(b"A" * 100)
+    st = os.stat(c)
+    os.utime(c, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    with pytest.raises(DataLeakError, match=r"\(audio\)"):
+        check_data_leaks([train], [val], [], cache_path=cache)
+    assert [os.path.basename(p) for p in reads] == ["c.flac"]
+
+    reads.clear()
+    with pytest.raises(DataLeakError):
+        check_data_leaks([train], [val], [], cache_path=cache, recompute_cache=True)
+    assert len(reads) == 2
+
+
+def test_corrupt_cache_is_not_fatal(corpus):
+    cache = corpus / "cache.sqlite"
+    cache.write_bytes(b"not a database")
+    train = _write_manifest(corpus / "train.json", [{"audio_filepath": "audio/a.flac", "text": "un"}])
+    val = _write_manifest(corpus / "val.json", [{"audio_filepath": "audio/b.flac", "text": "deux"}])
+    assert check_data_leaks([train], [val], [], cache_path=str(cache))["train_val_audio"] == 0
