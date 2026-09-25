@@ -76,6 +76,7 @@ import lightning.pytorch as pl
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.parts.utils.asr_batching import get_duration_cost_batch_sampler
+from nemo.collections.asr.parts.utils.data_leak_check import check_data_leaks, collect_manifests
 from nemo.collections.asr.parts.utils.config_audit import (
     assert_all_consumed,
     assert_effective_values,
@@ -898,6 +899,20 @@ def _build(cfg):
     happen has happened by the time this returns, and nothing has trained yet,
     so a failed audit costs a restart rather than a run.
     """
+    # Train/eval overlap check, first thing so a leaking config dies in minutes
+    # instead of after the model loads. Defaults to on when the block is
+    # absent: forgetting to configure it must not silently disable it. See
+    # nemo/collections/asr/parts/utils/data_leak_check.py for what is compared.
+    leak_cfg = cfg.get("data_leak_check", {}) or {}
+    if leak_cfg.get("enabled", True):
+        check_data_leaks(
+            train_manifests=collect_manifests(cfg.model.get("train_ds", None)),
+            val_manifests=collect_manifests(cfg.model.get("validation_ds", None)),
+            test_manifests=collect_manifests(cfg.model.get("test_ds", None)),
+        )
+    else:
+        logging.warning("data_leak_check.enabled is false, train/val/test overlap is NOT checked.")
+
     # Seed before anything builds a generator: data shuffling, dropout,
     # augmentation, and the initial state of any newly initialised head.
     seed = cfg.model.get("seed", None)

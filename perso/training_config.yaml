@@ -1523,6 +1523,17 @@ exp_manager:
 #
 # Both run after setup and before the first training step, so a false positive
 # costs a two-minute restart rather than days.
+# Train/eval overlap check (nemo/collections/asr/parts/utils/data_leak_check.py).
+# Before anything is built, every manifest under model.train_ds, validation_ds
+# and test_ds is fingerprinted by normalised text AND audio bytes, and the run
+# crashes if any training sample also appears in a val/test manifest (val vs
+# test overlap is only logged). Added after the UltiMed val.down-N slices were
+# found to be ~50% training clips, which skewed checkpoint selection of the
+# earlier runs. Also on when this block is missing. Only disable for a run
+# that knowingly evaluates on seen data.
+data_leak_check:
+  enabled: true
+
 config_audit:
   enabled: true
 
