@@ -313,7 +313,7 @@ model:
     # higher factor would teach those exact sentences rather than the names.
     # Watch val.drugs vs the other val slices, and judge on test.drugs.
     manifest_filepath:
-      # UltiMed-ASR-FR train split: 486,007 clips / 2,484 h on disk, 479,246
+      # UltiMed-ASR-FR train split (v1.1): 486,002 clips on disk, 479,241
       # clips / 2,398.3 h after the 38 s cap (dictionary + drugs + PARHAF +
       # acronyms; NO PARROT, it is eval-only CC BY-NC-SA; NO val/test rows).
       # Verified by scanning the manifest: every audio path resolves to
@@ -1505,10 +1505,20 @@ exp_manager:
   #        sets (observability) and consider a balanced monitor so
   #        checkpoint selection sees what rehearsal protects. .nemo export
   #        = best @ 11793.
+  # 1.6.0  three changes at once, after 1.5.0's evaluation turned out to be
+  #        flawed (its UltiMed val slices overlapped training, see
+  #        build_ultimed_val_slices.py and data_leak_check.py, now enforced):
+  #        (1) starts from moondream's parakeet-ultra instead of stock v3
+  #        (init_from_nemo_model), (2) UltiMed v1.1 data (bad clips dropped,
+  #        <unk> characters folded, percentages written "%") with the drugs
+  #        rows upsampled 4x per epoch (2.3% -> 8.5% of audio), (3) 20,000
+  #        steps = ~1.97 epochs instead of 15,000, max_epochs 3. Because all
+  #        three move together, a gain cannot be attributed to one of them;
+  #        the ultra baseline row of evaluate_checkpoint.py separates (1).
   #
   # This is also the run directory name, so a new value starts a clean run and
   # leaves the previous one resumable.
-  version: "1.5.0"
+  version: "1.6.0"
 
   # Only save the best model based on validation CER
   create_checkpoint_callback: true
