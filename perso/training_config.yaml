@@ -296,12 +296,22 @@ model:
     # Mix by hours after the 38 s cap: UltiMed 2,398.3 h (86.2%), Common
     # Voice rehearsal 351.7 h (12.6%: fr 200.0, en 100.0, de 20.0, it 20.0,
     # sv-SE 9.1, fi 2.6, the last two being their full CV train pools),
-    # diy 21.7 h (0.8%), drug_sentence 9.7 h (0.3%); total ~2,781.4 h.
+    # diy 21.7 h (0.8%), drug_sentence 9.7 h (0.3%); total ~2,781.4 h
+    # before the drugs upsampling below.
     # The two old sets are kept less for their weight than for their
     # different TTS voices (UltiMed is single-voice) and as continuity with
-    # the previous runs. No upsampling: UltiMed IS the target domain, and
-    # the CV share is set by how many hours were physically sampled (see
-    # the prep script).
+    # the previous runs. The CV share is set by how many hours were
+    # physically sampled (see the prep script).
+    #
+    # ONE upsampling, drug names: UltiMed's drugs rows are only 17,823 clips /
+    # 62.8 h (2.3% of the mix above), while drug names are what a medical
+    # dictation model gets most visibly wrong. train.drugs.jsonl (every drugs
+    # row of train.jsonl, written by perso/build_ultimed_val_slices.py) is
+    # listed 3 extra times, i.e. each drug clip is seen 4x per epoch: drugs
+    # 251.1 h of ~2,969.8 h (8.5%), and an epoch is ~6.8% longer. Kept at 3
+    # because it is always the same sentences in the same voice: a much
+    # higher factor would teach those exact sentences rather than the names.
+    # Watch val.drugs vs the other val slices, and judge on test.drugs.
     manifest_filepath:
       # UltiMed-ASR-FR train split: 486,007 clips / 2,484 h on disk, 479,246
       # clips / 2,398.3 h after the 38 s cap (dictionary + drugs + PARHAF +
@@ -314,6 +324,13 @@ model:
       # dataset root on the SSD, so nothing user-specific is committed.
       # 24 kHz FLAC, resampled to 16 kHz on the fly by the dataloader.
       - "./perso/ultimed_data_ignore-backups/NeMO_files/train.jsonl"
+      # drugs upsampling (see the mix note above): 3 extra passes over the
+      # drugs rows of train.jsonl. Change the count here, nothing else
+      # depends on it (the encoder cache is keyed per audio file, so repeated
+      # rows reuse the same cache entries).
+      - "./perso/ultimed_data_ignore-backups/NeMO_files/train.drugs.jsonl"
+      - "./perso/ultimed_data_ignore-backups/NeMO_files/train.drugs.jsonl"
+      - "./perso/ultimed_data_ignore-backups/NeMO_files/train.drugs.jsonl"
       # sentences containing drugs and dosages read out loud by TTS (4100 samples)
       - "./perso/drug_sentence_dataset/train.json"
       # DIY medical dataset

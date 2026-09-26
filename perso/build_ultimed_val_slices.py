@@ -32,6 +32,14 @@ and dictionary samples.
 PARROT is eval-only (CC BY-NC-SA), absent from the release-wide splits, and
 never trained on, so its out-of-domain monitor slice comes from PARROT/test.jsonl.
 
+One TRAINING subset is written here too, because it is the same "one category
+of a release-wide split" filter: train.drugs.jsonl holds EVERY drugs row of
+train.jsonl (no sampling, no duration cap: the trainer applies its own
+max_duration). The training config lists it after train.jsonl extra times to
+upsample the drug names, which are only ~2.3% of the training audio otherwise
+(NeMo reads a manifest listed N times N times per epoch). Its rows are a subset
+of train.jsonl, so data_leak_check treats them like any other training row.
+
 Made with Claude Code.
 
 Usage:
@@ -44,8 +52,9 @@ import json
 import random
 from pathlib import Path
 
-# (source manifest, category or None for all rows, output, sample size,
-#  duration-capped). Paths are relative to --nemo-files-dir.
+# (source manifest, category or None for all rows, output, sample size or None
+#  for every eligible row, duration-capped). Paths are relative to
+#  --nemo-files-dir.
 SLICES = [
     ("val.jsonl", "dictionary", "val.dictionary.down-600.jsonl", 600, True),
     ("val.jsonl", "parhaf", "val.parhaf.down-300.jsonl", 300, True),
@@ -56,14 +65,15 @@ SLICES = [
     ("test.jsonl", "parhaf", "test.parhaf.down-2500.jsonl", 2500, False),
     ("test.jsonl", "drugs", "test.drugs.down-2059.jsonl", 2059, False),
     ("test.jsonl", "acronyms", "test.acronyms.down-151.jsonl", 151, False),
+    ("train.jsonl", "drugs", "train.drugs.jsonl", None, False),
 ]
 
 SEED = 42
 
 
-def write_slice(rows: list[str], n: int, out: Path) -> None:
+def write_slice(rows: list[str], n: "int | None", out: Path) -> None:
     rng = random.Random(SEED)
-    picked = rows if len(rows) <= n else rng.sample(rows, n)
+    picked = rows if n is None or len(rows) <= n else rng.sample(rows, n)
     out.write_text("\n".join(picked) + "\n")
     hours = sum(json.loads(r)["duration"] for r in picked) / 3600
     print(f"{out}: {len(picked)} clips ({hours:.2f} h) from {len(rows)} eligible")
