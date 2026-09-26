@@ -1397,6 +1397,21 @@ macro_metrics:
   # Kept for comparability with previous runs' tensorboards.
   - name: "fleurs_fr_en_macro_val_wer"
     sources: ["fleurs_frval_wer", "fleurs_enval_wer"]
+  # Forgetting across ALL six FLEURS languages (added in 1.6.0). fr/en are
+  # rehearsed with Common Voice and sit in the monitor above, but 1.4.0 and
+  # 1.5.0 showed the unrehearsed-or-lightly-rehearsed languages move on their
+  # own (sv 20.2 -> 22.4, fi 19.3 -> 23.1 in 1.4.0), and six separate curves
+  # were easy to miss. Observability only, NOT the checkpoint monitor:
+  # sv/fi/de/it are not deployment languages, and weighting them into
+  # combined_macro would let a checkpoint win on Finnish.
+  - name: "fleurs_all6_macro_val_wer"
+    sources:
+      - "fleurs_frval_wer"
+      - "fleurs_enval_wer"
+      - "fleurs_deval_wer"
+      - "fleurs_itval_wer"
+      - "fleurs_svval_wer"
+      - "fleurs_fival_wer"
 
 # Experiment manager - handles logging, checkpointing, etc.
 # documentation: https://github.com/NVIDIA-NeM./perso/nemo/blob/412ab81dd5b17f763ee3aa723c67679698649a7./perso/nemo/utils/exp_manager.py
