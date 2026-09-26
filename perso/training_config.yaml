@@ -1102,8 +1102,8 @@ model:
       # 10 days.
       #
       # THIS IS THE TRAINING-LENGTH DECISION, not a safety limit: it sets the
-      # SHAPE of the cosine. At ~8,910 opt-steps per epoch, 15,000 steps is
-      # ~1.7 epochs, inside the max_epochs 2 ceiling below. Setting
+      # SHAPE of the cosine. At ~8,910 opt-steps per epoch, 15,000 steps was
+      # ~1.7 epochs (1.4.0 estimate; see 20,000 below). Setting
       # this longer than the run actually goes is actively harmful: the best
       # checkpoint then gets taken mid-anneal at a high LR, having never had
       # its final decay, and a completed cosine at N epochs beats a cosine
@@ -1135,10 +1135,21 @@ model:
       # anneal landing on the same window per-epoch-wise while giving the
       # rehearsal mix time to work. (Post-run: it was right-sized, the best
       # checkpoint landed at 11,519 inside a flat 10.5k-14.5k plateau.)
+      #
+      # 20,000 after 1.5.0 = ~2 epochs of the drugs-upsampled mix. 1.5.0's
+      # 15,000 steps covered 1.58 epochs, i.e. ~9,494 opt-steps per epoch;
+      # cost batching sizes batches by audio, so steps per epoch scale with
+      # hours, and the upsampling takes the mix from ~2,781 h to ~2,970 h
+      # (x1.068): ~10,140 opt-steps per epoch, 2 epochs ~20,280. Rounded DOWN
+      # to 20,000 (1.97 epochs) on purpose: rounding up would let the epoch
+      # limit end the run before the cosine finishes, the truncated-anneal
+      # failure described above. Longer than 1.5.0 also means this run tests
+      # the early-optimum argument again: save_top_k keeps the best
+      # checkpoint wherever it lands, so compare where it falls.
       # Kept equal to trainer.max_steps below,
       # which is what actually ends the run; the config audit fails the run
       # if the two disagree.
-      max_steps: 15000
+      max_steps: 20000
 
       # Minimum learning rate at end of training
       # Set to 0 for full annealing, or 0.1*lr to keep some learning
@@ -1195,13 +1206,15 @@ trainer:
   # calendar deadline.
   max_time: "10:00:00:00"
   # THE BINDING STOP. Lightning halts at whichever of max_steps and
-  # max_epochs arrives first, and at the measured 9,519 opt-steps per epoch
-  # this lands at 1.58 epochs, before max_epochs. Kept equal to optim.sched.max_steps so
+  # max_epochs arrives first. At the estimated ~10,140 opt-steps per epoch
+  # of the drugs-upsampled mix (derivation at optim.sched.max_steps), 20,000
+  # lands at ~1.97 epochs, before max_epochs. Kept equal to optim.sched.max_steps so
   # the cosine finishes exactly as the run does: change one and you must change
   # the other. The config audit compares them and fails the run if they drift.
   #
   # Measured on 1.3.0: 1.358 batches/s including validation and checkpoints,
-  # so 15,000 opt-steps (120,000 batches) is ~24.5 h.
+  # so 15,000 opt-steps (120,000 batches) is ~24.5 h, and 20,000 (160,000
+  # batches) ~32.7 h.
   #
   # Freezing the encoder did NOT speed 1.2.0 up, contrary to what was expected
   # here before it was measured: 1.1.0 ran at ~1.50 batches/s with the same
@@ -1212,15 +1225,17 @@ trainer:
   # profile, which ran 30+ h at these batch settings without an OOM. The CV
   # rehearsal clips are short (~5 s mean, 38 s cap applies regardless), so
   # they cannot produce a worse batch than the cost model was fitted on.
-  max_steps: 15000
+  max_steps: 20000
 
   # A ceiling only, never reached: max_steps above stops the run first. Left
   # above the real budget on purpose so that raising max_steps does not
   # silently truncate against an epoch limit nobody remembered to move.
+  # Raised from 2 to 3 when max_steps went to ~2 epochs, to keep that margin
+  # (the per-epoch step count is an estimate, not a measurement).
   #
   # No early stopping is configured. save_top_k below is what protects the
   # result: the best checkpoint is kept whenever it occurs.
-  max_epochs: 2
+  max_epochs: 3
 
   # Precision - use 16-bit mixed precision for memory efficiency
   # This uses automatic mixed precision (AMP)
