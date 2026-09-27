@@ -80,6 +80,14 @@ Rows whose audio file does not exist (a manifest not mounted on this machine,
 or a tarred set whose ``audio_filepath`` is a member name) still get the text
 check; their audio is counted as unchecked and reported, not silently passed.
 
+Progress
+--------
+Each phase (reading the manifests, ``os.stat``-ing every audio file, quick
+fingerprints, full hashes) shows a tqdm bar, and the cache load logs how many
+digests it restored, since a warm run over ~600k rows still takes minutes and
+used to print nothing until the verdict. Bars refresh at most every
+``_PROGRESS_INTERVAL`` seconds so a log file captured from stderr stays short.
+
 Written with Claude Code.
 """
 
@@ -92,6 +100,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from tqdm.auto import tqdm
+
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging
 
@@ -100,6 +110,15 @@ from nemo.utils import logging
 _MAX_EXAMPLES = 5
 _HASH_CHUNK = 1 << 20
 _QUICK_BYTES = 4096
+# Seconds between two refreshes of a progress bar: often enough to show the
+# check is alive, rare enough that a stderr log of a 10 min run stays a few
+# hundred lines.
+_PROGRESS_INTERVAL = 2.0
+
+
+def _progress(iterable=None, **kwargs):
+    """tqdm with this module's refresh rate, see "Progress" in the module docstring."""
+    return tqdm(iterable, mininterval=_PROGRESS_INTERVAL, dynamic_ncols=True, **kwargs)
 
 _PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
@@ -211,8 +230,12 @@ def _read_split(name: str, manifests: Iterable[str]) -> _Split:
     for manifest in manifests:
         if not os.path.isfile(manifest):
             raise DataLeakError(f"data_leak_check: {name} manifest not found: {manifest}")
-        with open(manifest, encoding="utf-8") as f:
+        # No total: counting the lines first would read every manifest twice.
+        with open(manifest, encoding="utf-8") as f, _progress(
+            desc=f"data_leak_check: reading {name} {os.path.basename(manifest)}", unit=" rows"
+        ) as bar:
             for line in f:
+                bar.update()
                 if not line.strip():
                     continue
                 row = json.loads(line)
@@ -276,6 +299,7 @@ class _HashCache:
         except sqlite3.Error as e:
             logging.warning(f"data_leak_check: cache {path} unreadable ({e}), recomputing everything.")
             self.entries = {}
+        logging.info(f"data_leak_check: loaded {len(self.entries)} cached audio digests from {path}.")
 
     def _entry(self, row: _Row) -> list:
         """The row's entry, reset if the file changed since it was cached."""
@@ -329,27 +353,39 @@ def _audio_keys(splits: Dict[str, "_Split"], cache: _HashCache) -> Dict[str, Dic
     fingerprint is unique to one role (those cannot match anything in another
     role, so their key only has to be distinct).
     """
-    for split in splits.values():
-        for row in split.rows:
-            if row.audio_path is not None:
-                st = os.stat(row.audio_path)
-                row.size, row.mtime_ns = st.st_size, st.st_mtime_ns
+    n_rows = sum(len(split.rows) for split in splits.values())
+    with _progress(total=n_rows, desc="data_leak_check: stat audio files", unit=" files") as bar:
+        for split in splits.values():
+            for row in split.rows:
+                if row.audio_path is not None:
+                    st = os.stat(row.audio_path)
+                    row.size, row.mtime_ns = st.st_size, st.st_mtime_ns
+                bar.update()
     eval_sizes = {r.size for name in ("val", "test") for r in splits[name].rows if r.size is not None}
 
     # Stage 1 + 2: quick fingerprint of every eval file and of the training
     # files that survive the size filter. Keyed per path, since one file can
     # be listed in several manifests; the digests themselves come from `cache`.
     quick: Dict[str, str] = {}
-    candidates: Dict[str, List[_Row]] = {}
-    for name, split in splits.items():
-        rows = []
-        for row in split.rows:
-            if row.audio_path is None or (name == "train" and row.size not in eval_sizes):
-                continue
-            if row.audio_path not in quick:
-                quick[row.audio_path] = cache.quick(row)
-            rows.append(row)
-        candidates[name] = rows
+    candidates: Dict[str, List[_Row]] = {
+        name: [
+            row
+            for row in split.rows
+            if row.audio_path is not None and not (name == "train" and row.size not in eval_sizes)
+        ]
+        for name, split in splits.items()
+    }
+    # Cached digests come back instantly and fresh ones cost a disk read, so the
+    # bar's postfix says which of the two the run is doing.
+    n_candidates = sum(len(rows) for rows in candidates.values())
+    with _progress(total=n_candidates, desc="data_leak_check: quick fingerprints", unit=" files") as bar:
+        for rows in candidates.values():
+            for row in rows:
+                if row.audio_path not in quick:
+                    quick[row.audio_path] = cache.quick(row)
+                bar.update()
+                if bar.n % 10000 == 0:
+                    bar.set_postfix(cached=cache.hits, read=cache.misses, refresh=False)
 
     # Stage 3: full hash only where a quick fingerprint appears in 2+ roles.
     roles_per_fp: Dict[str, Set[str]] = {}
@@ -358,17 +394,20 @@ def _audio_keys(splits: Dict[str, "_Split"], cache: _HashCache) -> Dict[str, Dic
             roles_per_fp.setdefault(quick[row.audio_path], set()).add(name)
     full: Set[str] = set()
     keys: Dict[str, Dict[tuple, _Row]] = {}
-    for name, rows in candidates.items():
-        table: Dict[tuple, _Row] = {}
-        for row in rows:
-            fp = quick[row.audio_path]
-            if len(roles_per_fp[fp]) > 1:
-                full.add(row.audio_path)
-                key = ("full", cache.full(row), row.segment)
-            else:
-                key = ("quick", fp, row.segment)
-            table.setdefault(key, row)
-        keys[name] = table
+    n_full = sum(len(roles_per_fp[quick[r.audio_path]]) > 1 for rows in candidates.values() for r in rows)
+    with _progress(total=n_full, desc="data_leak_check: full hashes", unit=" files") as bar:
+        for name, rows in candidates.items():
+            table: Dict[tuple, _Row] = {}
+            for row in rows:
+                fp = quick[row.audio_path]
+                if len(roles_per_fp[fp]) > 1:
+                    full.add(row.audio_path)
+                    key = ("full", cache.full(row), row.segment)
+                    bar.update()
+                else:
+                    key = ("quick", fp, row.segment)
+                table.setdefault(key, row)
+            keys[name] = table
     logging.info(
         f"data_leak_check: {len(quick)} audio files quick-fingerprinted ({cache.hits} from cache, "
         f"{cache.misses} read), {len(full)} compared by full hash."
