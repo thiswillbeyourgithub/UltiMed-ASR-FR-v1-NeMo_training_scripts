@@ -7,14 +7,18 @@ per source so validation stays cheap while still tracking every source.
 
 Every UltiMed slice samples one category out of the RELEASE-WIDE split
 (top-level val.jsonl / test.jsonl, the split the trainer's train.jsonl comes
-from). They must NOT come from the per-source <source>/val.jsonl: those are an
+from), never from a per-source <source>/val.jsonl. Those used to be an
 independent per-source partition written by 01_build_nemo_manifest.py before
 02_combine_nemo_manifests.py re-split the whole corpus, so a third to three
-quarters of a per-source val manifest sits in the global train.jsonl (measured
+quarters of a per-source val manifest sat in the global train.jsonl (measured
 2026-09-25: dictionary 33%, PARHAF 61%, acronyms 67%, drugs 72%). Sampling val slices
 from there made validation score training clips (every count still added up,
-since both are complete partitions, which is why it went unnoticed). The
-trainer's data_leak_check now refuses such a config.
+since both are complete partitions, which is why it went unnoticed). Since
+2026-09-27 the combine rewrites every <source>/{train,val,test}.jsonl from the
+release-wide split, so on current manifests the two agree; the top-level files
+stay the source here anyway, since manifests combined before that fix (or with
+--no-stratify-duration) may still disagree. The trainer's data_leak_check refuses
+a config whose val overlaps train either way.
 
 Slices are written next to their source manifest because audio paths inside
 are relative to the manifest's directory.

@@ -584,7 +584,8 @@ model:
 
       # ---- UltiMed-ASR-FR seeded validation slices ----------------------
       # Sampled from the RELEASE-WIDE val.jsonl by perso/build_ultimed_val_slices.py.
-      # Never point these at <source>/val.jsonl: that per-source split overlaps train.jsonl.
+      # Never point these at <source>/val.jsonl: manifests combined before 2026-09-27 hold
+      # an independent per-source split that overlaps train.jsonl (the combine now syncs them).
       - name: ultimed_dictionary
         manifest_filepath: "./perso/ultimed_data_ignore-backups/NeMO_files/val.dictionary.down-600.jsonl"
         sample_rate: 16000
