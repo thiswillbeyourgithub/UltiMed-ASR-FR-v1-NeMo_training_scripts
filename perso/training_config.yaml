@@ -1535,10 +1535,31 @@ exp_manager:
   #        steps = ~1.97 epochs instead of 15,000, max_epochs 3. Because all
   #        three move together, a gain cannot be attributed to one of them;
   #        the ultra baseline row of evaluate_checkpoint.py separates (1).
+  #        Outcome: cancelled by the user after the step-8000 round
+  #        (2026-09-28, 11.7 h in) to fix labels, while already ahead of
+  #        1.5.0 at equal steps on every clean set and at or past 1.5.0's
+  #        whole-run best on oli_drug_sentence (3.72 vs 3.89), diy (5.25
+  #        vs 5.37) and parrot (4.28, tie). Error analysis of step 7000:
+  #        63% of drug_sentence's 12.9% WER was the model writing doses in
+  #        digits ("4 milligrammes", as UltiMed labels do) against references
+  #        that spelled them ("quatre milligrammes"); the real recognition
+  #        error was ~4.8%, mostly near-miss drug spellings (modafinyl,
+  #        roxadustate, keptopril).
+  # 1.7.0  same recipe as 1.6.0, fresh start (not a resume), on relabelled
+  #        data: UltiMed v1.3 labels (spelled quantities before a unit or a
+  #        duration in digits, counts like "deux comprimés" kept spelled,
+  #        "petit-déjeuner" hyphenated), and the hand-made drug_sentence and
+  #        oli_drug_sentence manifests passed through the same
+  #        05_normalize_text.py, so every source now writes doses one way.
+  #        drug_sentence train also lost 2 junk rows (a leaked LLM reasoning
+  #        label and a 16-word label on a 0.3 s clip, 04_drop_bad_rows.py).
+  #        drug_sentence / oli numbers are NOT comparable with 1.6.0 and
+  #        earlier (different references: re-scoring 1.6.0 step 7000 gives
+  #        drug_sentence 12.9 -> 5.7, oli 3.9 -> 14.0).
   #
   # This is also the run directory name, so a new value starts a clean run and
   # leaves the previous one resumable.
-  version: "1.6.0"
+  version: "1.7.0"
 
   # Only save the best model based on validation CER
   create_checkpoint_callback: true
