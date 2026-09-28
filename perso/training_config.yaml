@@ -1273,10 +1273,14 @@ trainer:
   # over. 1.1.0's macro bottomed at step 7,500, inside the first epoch,
   # between two rounds 20,000 batches apart.
   #
-  # A full 15-set validation pass measures 4.5 min (246/289/283 s over 1.1.0's
-  # three in-epoch rounds), so 14 rounds cost ~63 min of the ~24 h run. Must
-  # stay < batches per epoch (measured 76,152 under cost batching with the CV
-  # rehearsal) or Lightning errors out at startup.
+  # A full validation pass measured 4.5 min with 15 sets (246/289/283 s over
+  # 1.1.0's three in-epoch rounds) and still ~4-5 min with 1.6.0's 18 sets
+  # (the tensorboard gap between the last train log and each val round).
+  # At 20,000 steps that is ~20 rounds, ~1.5 h of a ~29 h run (1.6.0 paced
+  # 78-103 min per 1,000 steps including the round; 8,000 steps in 11.7 h).
+  # Must stay < batches per epoch (measured 76,152 under cost batching with
+  # the CV rehearsal, ~81k estimated with the drugs upsampling) or Lightning
+  # errors out at startup.
   val_check_interval: 8000
 
   # Disable Lightning's built-in logger so NeMo's exp_manager can create
