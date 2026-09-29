@@ -891,6 +891,40 @@ def main(cfg):
     trainer.fit(asr_model)
 
 
+def add_validation_metric_callbacks(trainer, cfg):
+    """Install the macro and normalised-WER validation callbacks the config asks for.
+
+    Shared by training (_build below) and perso/evaluate_checkpoint.py, so a scored
+    checkpoint reports exactly the metrics its training curves show.
+    """
+    # Macro validation metrics (e.g. checkpoint monitor averaged over
+    # several languages). Must be inserted at the *front* of the callback
+    # list so it runs before the checkpoint callback appended by exp_manager.
+    macro_specs = cfg.get("macro_metrics", None)
+    if macro_specs:
+        macro_specs = OmegaConf.to_container(macro_specs, resolve=True)
+        if cfg.get("normalised_wer", True):
+            # Every macro gets a _norm twin over the _norm sources, rather than
+            # making the YAML restate the source lists and drift out of sync.
+            macro_specs = macro_specs + [
+                {"name": f"{s['name']}_norm", "sources": [f"{src}_norm" for src in s["sources"]]}
+                for s in macro_specs
+            ]
+        trainer.callbacks.insert(0, _MacroMetricCallback(macro_specs))
+        logging.info(
+            "Macro metrics active: "
+            + ", ".join(f"{s['name']} <- mean({', '.join(s['sources'])})" for s in macro_specs)
+        )
+
+    # Normalised WER, logged next to the raw one. Inserted after the macro
+    # callback so it ends up *before* it, because the macros average whatever
+    # is already in callback_metrics and the _norm sources have to be there
+    # first. Order in trainer.callbacks is the order the hooks run.
+    if cfg.get("normalised_wer", True):
+        trainer.callbacks.insert(0, _NormalisedWERCallback())
+        logging.info("Normalised WER active, logged as <name>val_wer_norm next to each raw <name>val_wer.")
+
+
 def _build(cfg):
     """Everything from raw config to a fit-ready model, minus trainer.fit.
 
@@ -927,32 +961,7 @@ def _build(cfg):
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 
-    # Macro validation metrics (e.g. checkpoint monitor averaged over
-    # several languages). Must be inserted at the *front* of the callback
-    # list so it runs before the checkpoint callback appended by exp_manager.
-    macro_specs = cfg.get("macro_metrics", None)
-    if macro_specs:
-        macro_specs = OmegaConf.to_container(macro_specs, resolve=True)
-        if cfg.get("normalised_wer", True):
-            # Every macro gets a _norm twin over the _norm sources, rather than
-            # making the YAML restate the source lists and drift out of sync.
-            macro_specs = macro_specs + [
-                {"name": f"{s['name']}_norm", "sources": [f"{src}_norm" for src in s["sources"]]}
-                for s in macro_specs
-            ]
-        trainer.callbacks.insert(0, _MacroMetricCallback(macro_specs))
-        logging.info(
-            "Macro metrics active: "
-            + ", ".join(f"{s['name']} <- mean({', '.join(s['sources'])})" for s in macro_specs)
-        )
-
-    # Normalised WER, logged next to the raw one. Inserted after the macro
-    # callback so it ends up *before* it, because the macros average whatever
-    # is already in callback_metrics and the _norm sources have to be there
-    # first. Order in trainer.callbacks is the order the hooks run.
-    if cfg.get("normalised_wer", True):
-        trainer.callbacks.insert(0, _NormalisedWERCallback())
-        logging.info("Normalised WER active, logged as <name>val_wer_norm next to each raw <name>val_wer.")
+    add_validation_metric_callbacks(trainer, cfg)
 
     if hasattr(cfg, 'init_from_ptl_ckpt') and cfg.init_from_ptl_ckpt is not None:
         raise NotImplementedError(

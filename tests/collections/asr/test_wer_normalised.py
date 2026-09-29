@@ -33,7 +33,11 @@ import pytest
 import torch
 from torchmetrics import Metric
 
-from examples.asr.speech_to_text_finetune_cached import _MacroMetricCallback, _NormalisedWERCallback
+from examples.asr.speech_to_text_finetune_cached import (
+    _MacroMetricCallback,
+    _NormalisedWERCallback,
+    add_validation_metric_callbacks,
+)
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.metrics.wer_normalised import normalise_text, normalised_edit_counts
 
@@ -313,3 +317,33 @@ class TestNormalisedWERCallback:
         trainer, module = _FakeTrainer(), _FakeModule(None)
         _run_validation(_NormalisedWERCallback(), trainer, module, [(0, 1, 10)])
         assert "val_wer_norm" in trainer.callback_metrics
+
+
+class TestAddValidationMetricCallbacks:
+    """perso/evaluate_checkpoint.py used to install only the macro callback, so
+    scoring a checkpoint silently produced no *_norm metric at all (found
+    2026-09-29 benching run 1.7.0). Both scripts now share this installer."""
+
+    def test_installs_norm_before_macro_with_norm_twins(self):
+        from types import SimpleNamespace
+
+        from omegaconf import OmegaConf
+
+        trainer = SimpleNamespace(callbacks=["checkpoint"])
+        cfg = OmegaConf.create({"macro_metrics": [{"name": "combined", "sources": ["a", "b"]}]})
+        add_validation_metric_callbacks(trainer, cfg)
+        norm, macro, rest = trainer.callbacks[0], trainer.callbacks[1], trainer.callbacks[2:]
+        assert isinstance(norm, _NormalisedWERCallback)
+        assert isinstance(macro, _MacroMetricCallback)
+        assert rest == ["checkpoint"]
+        assert [s["name"] for s in macro.specs] == ["combined", "combined_norm"]
+
+    def test_normalised_wer_off_installs_macro_only(self):
+        from types import SimpleNamespace
+
+        from omegaconf import OmegaConf
+
+        trainer = SimpleNamespace(callbacks=[])
+        cfg = OmegaConf.create({"normalised_wer": False, "macro_metrics": [{"name": "c", "sources": ["a"]}]})
+        add_validation_metric_callbacks(trainer, cfg)
+        assert [type(c) for c in trainer.callbacks] == [_MacroMetricCallback]

@@ -47,7 +47,7 @@ from nemo.utils import logging
 # averaging, so "combined_macro_val_wer" here means exactly what it means in
 # the training curves. Importing it also applies that module's torch.load
 # weights_only shim, which .ckpt loading below needs.
-from examples.asr.speech_to_text_finetune_cached import _MacroMetricCallback
+from examples.asr.speech_to_text_finetune_cached import add_validation_metric_callbacks
 
 
 def parse_args():
@@ -146,9 +146,9 @@ def main():
         enable_checkpointing=False,
         enable_progress_bar=True,
     )
-    macro_specs = cfg.get("macro_metrics", None)
-    if macro_specs:
-        trainer.callbacks.insert(0, _MacroMetricCallback(OmegaConf.to_container(macro_specs, resolve=True)))
+    # The same macro and normalised-WER callbacks as training, so the scores
+    # match the training curves (the *_norm twins included).
+    add_validation_metric_callbacks(trainer, cfg)
     model.set_trainer(trainer)
 
     # Validation sets only. Deliberately not setup_dataloaders(), which would
