@@ -158,11 +158,12 @@ def main():
     trainer.validate(model)
 
     # The macro callback writes into callback_metrics rather than logging, so
-    # read the results from there.
+    # read the results from there. The *_norm twins (lowercased, punctuation
+    # dropped) are kept too: they are what run comparisons use.
     results = {
         k: float(v)
         for k, v in trainer.callback_metrics.items()
-        if k.endswith("val_wer")
+        if k.endswith(("val_wer", "val_wer_norm"))
     }
     if not results:
         raise SystemExit("No *val_wer metrics were produced. Did validation actually run?")
