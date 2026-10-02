@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the opt-in web-export flags (mask-free graph, runtime positional
-encoding, padded-batch NaN tripwire) used by perso/export_onnx.py
---web-optimized. Written with Claude Code."""
+"""Tests for the opt-in web-export flags (key-only additive padding mask,
+runtime positional encoding) used by perso/export_onnx.py --web-optimized.
+Written with Claude Code."""
 
 import pytest
 import torch
@@ -68,61 +68,72 @@ class TestRuntimePositionalEncoding:
 
 class TestWebExportEncoderFlags:
     @pytest.mark.unit
-    def test_skip_mask_matches_masked_on_full_length(self, encoder):
+    def test_key_pad_mask_bitexact_on_batch1(self, encoder):
         torch.manual_seed(0)
         audio = torch.randn(1, 80, 64)
         length = torch.tensor([64], dtype=torch.int64)
         with torch.no_grad():
-            out_masked, len_masked = encoder(audio_signal=audio, length=length)
-        encoder.export_skip_mask = True
-        encoder.export_pad_tripwire = True
+            out_full, len_full = encoder(audio_signal=audio, length=length)
+        encoder.export_key_pad_mask = True
         with torch.no_grad():
-            out_free, len_free = encoder(audio_signal=audio, length=length)
-        assert torch.equal(len_masked, len_free)
-        assert torch.equal(out_masked, out_free)
+            out_light, len_light = encoder(audio_signal=audio, length=length)
+        assert torch.equal(len_full, len_light)
+        assert torch.equal(out_full, out_light)
 
     @pytest.mark.unit
-    def test_create_masks_returns_none(self, encoder):
-        encoder.export_skip_mask = True
-        pad_mask, att_mask = encoder._create_masks(
+    def test_key_pad_mask_matches_full_mask_on_short_batch1(self, encoder):
+        # Real mel frontends can report length < T for a lone clip (onnx-asr
+        # emits one extra frame when the sample count is a multiple of the
+        # hop): the light mask must ignore that frame like the full mask does.
+        torch.manual_seed(0)
+        audio = torch.randn(1, 80, 72)
+        length = torch.tensor([64], dtype=torch.int64)
+        with torch.no_grad():
+            out_full, len_full = encoder(audio_signal=audio, length=length)
+        encoder.export_key_pad_mask = True
+        with torch.no_grad():
+            out_light, _ = encoder(audio_signal=audio, length=length)
+        n = int(len_full[0])  # padded output frames differ (full mask zeroes them) and are trimmed anyway
+        assert torch.allclose(out_full[..., :n], out_light[..., :n], atol=1e-5)
+
+    @pytest.mark.unit
+    def test_key_pad_mask_ragged_batch_matches_batch1(self, encoder):
+        torch.manual_seed(0)
+        encoder.export_key_pad_mask = True
+        a, b = torch.randn(1, 80, 64), torch.randn(1, 80, 40)
+        batch = torch.zeros(2, 80, 64)
+        batch[0], batch[1, :, :40] = a[0], b[0]
+        with torch.no_grad():
+            out, lens = encoder(audio_signal=batch, length=torch.tensor([64, 40]))
+            for k, x in enumerate((a, b)):
+                ref, ref_len = encoder(audio_signal=x, length=torch.tensor([x.shape[-1]]))
+                n = int(ref_len[0])
+                assert int(lens[k]) == n
+                assert torch.allclose(out[k, :, :n], ref[0, :, :n], atol=1e-4)
+
+    @pytest.mark.unit
+    def test_create_masks_returns_key_bias(self, encoder):
+        encoder.export_key_pad_mask = True
+        pad_mask, bias = encoder._create_masks(
             att_context_size=encoder.att_context_size,
-            padding_length=torch.tensor([8]),
+            padding_length=torch.tensor([8, 5]),
             max_audio_length=8,
             offset=None,
             device=torch.device('cpu'),
         )
-        assert pad_mask is None and att_mask is None
+        assert pad_mask.tolist() == [[False] * 8, [False] * 5 + [True] * 3]
+        assert bias.shape == (2, 1, 8) and bias.dtype == torch.float32
+        assert bias[0].eq(0).all() and bias[1, 0, :5].eq(0).all() and bias[1, 0, 5:].eq(-10000.0).all()
 
     @pytest.mark.unit
-    def test_tripwire_poisons_padded_batch(self, encoder):
-        encoder.export_skip_mask = True
-        encoder.export_pad_tripwire = True
-        audio = torch.randn(2, 80, 64)
-        length = torch.tensor([64, 32], dtype=torch.int64)
-        with torch.no_grad():
-            out, _ = encoder(audio_signal=audio, length=length)
-        assert torch.isnan(out).all(), "padded batch must be NaN-poisoned"
-
-    @pytest.mark.unit
-    def test_tripwire_clean_on_equal_length_batch(self, encoder):
-        encoder.export_skip_mask = True
-        encoder.export_pad_tripwire = True
-        audio = torch.randn(2, 80, 64)
-        length = torch.tensor([64, 64], dtype=torch.int64)
-        with torch.no_grad():
-            out, _ = encoder(audio_signal=audio, length=length)
-        assert torch.isfinite(out).all()
-
-    @pytest.mark.unit
-    def test_tripwire_clean_on_batch1_short_length(self, encoder):
-        # Regression: real mel frontends report length < T for every clip in
-        # some cases (onnx-asr emits one extra frame when the sample count is
-        # a multiple of the hop). A batch-1 clip must NEVER be poisoned; the
-        # tripwire only targets mixed-length batches.
-        encoder.export_skip_mask = True
-        encoder.export_pad_tripwire = True
-        audio = torch.randn(1, 80, 65)
-        length = torch.tensor([64], dtype=torch.int64)
-        with torch.no_grad():
-            out, _ = encoder(audio_signal=audio, length=length)
-        assert torch.isfinite(out).all(), "batch-1 with length < T must stay finite"
+    def test_key_pad_mask_rejects_sdpa(self, encoder):
+        encoder.export_key_pad_mask = True
+        encoder.use_pytorch_sdpa = True
+        with pytest.raises(ValueError):
+            encoder._create_masks(
+                att_context_size=encoder.att_context_size,
+                padding_length=torch.tensor([8]),
+                max_audio_length=8,
+                offset=None,
+                device=torch.device('cpu'),
+            )

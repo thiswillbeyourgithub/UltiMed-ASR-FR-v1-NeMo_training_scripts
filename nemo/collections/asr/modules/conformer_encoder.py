@@ -482,15 +482,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self.setup_streaming_params()
         self.export_cache_support = False
-        # Opt-in ONNX-export tweaks for batch-1 / equal-length-batch runtimes
-        # (set by an export script, never during training or regular
-        # inference; incompatible with the cache-aware export path):
-        # export_skip_mask drops the attention/padding masks from the
-        # exported graph (see _create_masks), export_pad_tripwire makes a
-        # mixed-length batch (min(length) < max(length)) return NaN instead
-        # of silently wrong output (see forward_internal).
-        self.export_skip_mask = False
-        self.export_pad_tripwire = False
+        # Opt-in ONNX-export tweak (set by an export script, never during
+        # training or regular inference; incompatible with the cache-aware
+        # export path): export_key_pad_mask replaces the (B, T, T) boolean
+        # attention mask with a key-only additive bias (see _create_masks),
+        # which keeps padded (mixed-length) batches correct at the cost of
+        # one Add per layer.
+        self.export_key_pad_mask = False
 
         self.layer_drop_probs = compute_stochastic_depth_drop_probs(
             len(self.layers), stochastic_depth_drop_prob, stochastic_depth_mode, stochastic_depth_start_layer
@@ -624,25 +622,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if length is None:
             length = audio_signal.new_full(
                 (audio_signal.size(0),), audio_signal.size(-1), dtype=torch.int64, device=audio_signal.device
-            )
-
-        pad_poison = None
-        if self.export_pad_tripwire:
-            # Companion to export_skip_mask: ONNX cannot abort at runtime, so
-            # when the batch mixes sequence lengths (min(length) < max(length),
-            # i.e. some item is padded relative to another) poison the output
-            # with NaN so the call fails loudly downstream instead of
-            # returning silently degraded output. Batch-1 and equal-length
-            # batches never trip it. Deliberately NOT compared against the
-            # time dim: real front-ends legitimately report length < T for
-            # every item (e.g. onnx-asr's mel frontend emits one extra frame
-            # whenever the sample count is a multiple of the hop), and those
-            # uniform trailing frames are part of the mask-free contract, not
-            # an error.
-            pad_poison = torch.where(
-                length.min() < length.max(),
-                torch.full((), float("nan"), dtype=torch.float32, device=audio_signal.device),
-                torch.zeros((), dtype=torch.float32, device=audio_signal.device),
             )
 
         # select a random att_context_size with the distribution specified by att_context_probs during training
@@ -784,8 +763,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
-            if pad_poison is not None:
-                audio_signal = audio_signal + pad_poison
             return audio_signal, length
 
     def update_max_seq_length(self, seq_length: int, device):
@@ -822,15 +799,22 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.pos_enc.extend_pe(max_audio_length, device, dtype)
 
     def _create_masks(self, att_context_size, padding_length, max_audio_length, offset, device):
-        if self.export_skip_mask:
-            # Mask-free export: for batch-1 or equal-length batches (every
-            # length == the time dim) the attention/padding masks are all
-            # no-ops, and every masked_fill site downstream guards on
-            # `mask is not None`, so returning None removes the whole mask
-            # construction plus 3 Where ops per layer from the exported
-            # graph. Padded (unequal-length) batches are INVALID with this
-            # flag: pair it with export_pad_tripwire so they fail loudly.
-            return None, None
+        if self.export_key_pad_mask:
+            # Export-only light mask: instead of the (B, T, T) boolean mask
+            # (built from O(T^2) ops and applied with two Where per layer),
+            # return a key-only additive bias (B, 1, T): 0 for real frames,
+            # -10000 for padded ones, added to the attention scores once per
+            # layer (MultiHeadAttention.forward_attention). For batch 1 the
+            # bias is all zeros, so the output is bit-identical to the full
+            # mask; for a mixed-length batch each item matches its own
+            # batch-1 run on its valid frames. Padded query rows are left
+            # unmasked (their outputs are trimmed by `length` downstream).
+            if self.use_pytorch_sdpa:
+                raise ValueError("export_key_pad_mask requires use_pytorch_sdpa=False")
+            pad_mask = torch.arange(0, max_audio_length, device=device).expand(
+                padding_length.size(0), -1
+            ) >= padding_length.unsqueeze(-1)
+            return pad_mask, pad_mask.to(torch.float32).unsqueeze(1) * -10000.0
         if self.self_attention_model != "rel_pos_local_attn":
             att_mask = torch.ones(1, max_audio_length, max_audio_length, dtype=torch.bool, device=device)
 

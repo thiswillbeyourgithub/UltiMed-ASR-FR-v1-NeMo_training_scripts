@@ -94,9 +94,11 @@ branch tip is a working tree. Each commit message explains the why at length.
    discover on day five of a six-day run.
 
 6. **`export: opt-in web-export encoder flags and ONNX exporter`**
-   Three off-by-default encoder flags (mask-free graph, runtime relative-position encoding, a
-   padded-batch NaN tripwire) that make the exported encoder usable under onnxruntime-web, plus the
-   exporter and the in-domain int8 calibration set.
+   Off-by-default encoder export flags that make the exported encoder usable under onnxruntime-web, plus the
+   exporter and the in-domain int8 calibration set. Originally a mask-free graph with a padded-batch NaN tripwire
+   (batch 1 or equal-length batches only); since 2026-10-02 a key-only additive padding bias instead
+   (`export_key_pad_mask`: one Add per layer, bit-identical at batch 1, correct for mixed-length batches), plus the
+   runtime relative-position encoding. Changed with Claude Code.
 
 7. **`data: corpus preparation, rehearsal sets and the manifests`**
    Everything that builds the manifests: the LLM-generated in-domain sentence sets, the FLEURS and

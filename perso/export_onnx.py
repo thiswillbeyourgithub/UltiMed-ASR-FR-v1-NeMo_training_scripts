@@ -45,15 +45,12 @@ from loguru import logger
     is_flag=True,
     default=False,
     help=(
-        "Export an encoder graph specialized for batch-1 / equal-length-batch "
-        "runtimes (the parakeet_web contract): drops the attention/padding "
-        "masks (72 Where ops + the O(T^2) mask construction), computes the "
+        "Export an encoder graph for in-browser and batched runtimes (the "
+        "parakeet_web contract): replaces the O(T^2) attention mask with a "
+        "key-only additive padding bias (one Add per layer; batch 1 is "
+        "bit-identical, mixed-length batches stay correct) and computes the "
         "relative positional encoding in-graph (removes the 41MB baked table "
-        "AND the ~400s pos_emb_max_len cap on input length), and adds a NaN "
-        "tripwire so a PADDED (unequal-length) batch returns NaN instead of "
-        "silently degraded output. WARNING: the exported encoder is INVALID "
-        "for padded batches; benchmark/eval harnesses must run batch 1 or "
-        "equal-length batches only."
+        "AND the ~400s pos_emb_max_len cap on input length)."
     ),
 )
 def main(
@@ -75,13 +72,9 @@ def main(
     if web_optimized:
         # Opt-in flags consumed by ConformerEncoder._create_masks /
         # forward_internal and RelPositionalEncoding.forward during export.
-        model.encoder.export_skip_mask = True
-        model.encoder.export_pad_tripwire = True
+        model.encoder.export_key_pad_mask = True
         model.encoder.pos_enc.export_runtime_pe = True
-        logger.info(
-            "web-optimized export: mask-free graph + runtime positional "
-            "encoding + padded-batch NaN tripwire (batch-1/equal-length only)"
-        )
+        logger.info("web-optimized export: key-only padding bias + runtime positional encoding")
 
     logger.info("Exporting ONNX to {}", onnx_path)
     model.export(str(onnx_path))

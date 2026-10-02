@@ -127,12 +127,15 @@ class MultiHeadAttention(nn.Module):
         Args:
             value (torch.Tensor): (batch, time2, size)
             scores(torch.Tensor): (batch, time1, time2)
-            mask(torch.Tensor): (batch, time1, time2)
+            mask(torch.Tensor): (batch, time1, time2) bool, True = masked, or an additive float bias (batch, 1, time2)
         returns:
             value (torch.Tensor): transformed `value` (batch, time2, d_model) weighted by the attention scores
         """
         n_batch = value.size(0)
-        if mask is not None:
+        if mask is not None and mask.dtype != torch.bool:
+            # additive key-padding bias (batch, 1, time2) from ConformerEncoder.export_key_pad_mask
+            attn = torch.softmax(scores + mask.unsqueeze(1), dim=-1)  # (batch, head, time1, time2)
+        elif mask is not None:
             mask = mask.unsqueeze(1)  # (batch, 1, time1, time2)
             scores = scores.masked_fill(mask, -INF_VAL)
             attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
